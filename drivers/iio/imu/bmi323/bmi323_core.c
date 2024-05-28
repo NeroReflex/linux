@@ -132,6 +132,13 @@ struct bmi323_data {
 	unsigned int feature_events;
 
 	/*
+	 * Lock to protect concurrent access to device while the device is entering
+	 * or exiting sleep power modes.
+	 */
+	struct mutex sleep_mutex;
+	bool sleeping;
+
+	/*
 	 * Lock to protect the members of device's private data from concurrent
 	 * access and also to serialize the access of extended registers.
 	 * See bmi323_write_ext_reg(..) for more info.
@@ -1383,6 +1390,12 @@ static irqreturn_t bmi323_trigger_handler(int irq, void *p)
 	struct bmi323_data *data = iio_priv(indio_dev);
 	int ret, bit, index = 0;
 
+	/* Lock to protect the sleeping status */
+	guard(mutex)(&data->sleep_mutex);
+	if (data->sleeping) {
+		return IRQ_NONE;
+	}
+
 	/* Lock to protect the data->buffer */
 	guard(mutex)(&data->mutex);
 
@@ -1639,6 +1652,14 @@ static int bmi323_read_avail(struct iio_dev *indio_dev,
 			     const int **vals, int *type, int *length,
 			     long mask)
 {
+	struct bmi323_data *data = iio_priv(indio_dev);
+
+	/* Lock to protect the sleeping status */
+	guard(mutex)(&data->sleep_mutex);
+	if (data->sleeping) {
+		return -EAGAIN;
+	}
+
 	enum bmi323_sensor_type sensor;
 
 	switch (mask) {
@@ -1668,6 +1689,12 @@ static int bmi323_write_raw(struct iio_dev *indio_dev,
 			    int val2, long mask)
 {
 	struct bmi323_data *data = iio_priv(indio_dev);
+
+	/* Lock to protect the sleeping status */
+	guard(mutex)(&data->sleep_mutex);
+	if (data->sleeping) {
+		return -EAGAIN;
+	}
 
 	switch (mask) {
 	case IIO_CHAN_INFO_SAMP_FREQ:
@@ -1713,6 +1740,12 @@ static int bmi323_read_raw(struct iio_dev *indio_dev,
 			   int *val2, long mask)
 {
 	struct bmi323_data *data = iio_priv(indio_dev);
+
+	/* Lock to protect the sleeping status */
+	guard(mutex)(&data->sleep_mutex);
+	if (data->sleeping) {
+		return -EAGAIN;
+	}
 
 	switch (mask) {
 	case IIO_CHAN_INFO_PROCESSED:
@@ -2077,7 +2110,9 @@ int bmi323_core_probe(struct device *dev)
 	data = iio_priv(indio_dev);
 	data->dev = dev;
 	data->regmap = regmap;
+	data->sleeping = false;
 	mutex_init(&data->mutex);
+	mutex_init(&data->sleep_mutex);
 
 	ret = bmi323_init(data);
 	if (ret)
@@ -2117,6 +2152,89 @@ int bmi323_core_probe(struct device *dev)
 	return 0;
 }
 EXPORT_SYMBOL_NS_GPL(bmi323_core_probe, IIO_BMI323);
+
+#if defined(CONFIG_PM_SLEEP)
+static int bmi323_core_suspend(struct device *dev)
+{
+	struct iio_dev *indio_dev = dev_get_drvdata(dev);
+	struct bmi323_data *data = iio_priv(indio_dev);
+
+	guard(mutex)(&data->sleep_mutex);
+	data->sleeping = true;
+
+/*
+	mutex_lock(&data->mutex);
+	bmc150_accel_set_mode(data, BMC150_ACCEL_SLEEP_MODE_SUSPEND, 0);
+	mutex_unlock(&data->mutex);
+*/
+	return 0;
+}
+
+static int bmi323_core_resume(struct device *dev)
+{
+	struct iio_dev *indio_dev = dev_get_drvdata(dev);
+	struct bmi323_data *data = iio_priv(indio_dev);
+
+	guard(mutex)(&data->sleep_mutex);
+	data->sleeping = false;
+
+/*
+	mutex_lock(&data->mutex);
+	bmc150_accel_set_mode(data, BMC150_ACCEL_SLEEP_MODE_NORMAL, 0);
+	bmc150_accel_fifo_set_mode(data);
+	mutex_unlock(&data->mutex);
+
+	if (data->resume_callback)
+		data->resume_callback(dev);
+*/
+	return 0;
+}
+#endif
+
+#if defined(CONFIG_PM)
+static int bmi323_core_runtime_suspend(struct device *dev)
+{
+	struct iio_dev *indio_dev = dev_get_drvdata(dev);
+	struct bmi323_data *data = iio_priv(indio_dev);
+	int ret;
+/*
+	ret = bmc150_accel_set_mode(data, BMC150_ACCEL_SLEEP_MODE_SUSPEND, 0);
+	if (ret < 0)
+		return -EAGAIN;
+*/
+	return 0;
+}
+
+static int bmi323_core_runtime_resume(struct device *dev)
+{
+	struct iio_dev *indio_dev = dev_get_drvdata(dev);
+	struct bmi323_data *data = iio_priv(indio_dev);
+	int ret;
+	int sleep_val;
+/*
+	ret = bmc150_accel_set_mode(data, BMC150_ACCEL_SLEEP_MODE_NORMAL, 0);
+	if (ret < 0)
+		return ret;
+	ret = bmc150_accel_fifo_set_mode(data);
+	if (ret < 0)
+		return ret;
+
+	sleep_val = bmc150_accel_get_startup_times(data);
+	if (sleep_val < 20)
+		usleep_range(sleep_val * 1000, 20000);
+	else
+		msleep_interruptible(sleep_val);
+*/
+	return 0;
+}
+#endif
+
+const struct dev_pm_ops bmi323_core_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(bmi323_core_suspend, bmi323_core_resume)
+	SET_RUNTIME_PM_OPS(bmi323_core_runtime_suspend,
+			   bmi323_core_runtime_resume, NULL)
+};
+EXPORT_SYMBOL_NS_GPL(bmi323_core_pm_ops, IIO_BMI323);
 
 MODULE_DESCRIPTION("Bosch BMI323 IMU driver");
 MODULE_AUTHOR("Jagath Jog J <jagathjog1996@gmail.com>");
