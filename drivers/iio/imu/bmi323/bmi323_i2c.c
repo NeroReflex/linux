@@ -130,6 +130,7 @@ static struct i2c_driver bmi323_i2c_driver = {
 		.name = "bmi323",
 		.of_match_table = bmi323_of_i2c_match,
 		.acpi_match_table = bmi323_acpi_match,
+		.pm	= &bmi323_core_pm_ops,
 	},
 	.probe = bmi323_i2c_probe,
 	.id_table = bmi323_i2c_ids,
