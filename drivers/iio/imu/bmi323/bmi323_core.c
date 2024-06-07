@@ -2160,6 +2160,18 @@ static int bmi323_core_suspend(struct device *dev)
 	struct bmi323_data *data = iio_priv(indio_dev);
 
 	guard(mutex)(&data->sleep_mutex);
+
+	if (indio_dev->pollfunc) {
+		if (indio_dev->pollfunc->irq > 0) {
+			disable_irq(indio_dev->pollfunc->irq);
+		} else {
+			dev_err(data->dev, "indio_dev->pollfunc->irq is %d\n", indio_dev->pollfunc->irq);
+		}
+	} else {
+		dev_err(data->dev, "indio_dev->pollfunc is NULL\n");
+	}
+	
+
 	data->sleeping = true;
 
 /*
@@ -2176,6 +2188,17 @@ static int bmi323_core_resume(struct device *dev)
 	struct bmi323_data *data = iio_priv(indio_dev);
 
 	guard(mutex)(&data->sleep_mutex);
+
+	if (indio_dev->pollfunc) {
+		if (indio_dev->pollfunc->irq > 0) {
+			enable_irq(indio_dev->pollfunc->irq);
+		} else {
+			dev_err(data->dev, "indio_dev->pollfunc->irq is %d\n", indio_dev->pollfunc->irq);
+		}
+	} else {
+		dev_err(data->dev, "indio_dev->pollfunc is NULL\n");
+	}
+
 	data->sleeping = false;
 
 /*
