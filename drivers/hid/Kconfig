@@ -164,6 +164,17 @@ config HID_ASUS
 	- GL553V series
 	- GL753V series
 
+config HID_MSI_CLAW
+	tristate "MSI Claw"
+	depends on USB_HID
+	select POWER_SUPPLY
+	help
+	Support for MSI Claw HID device used to configure the device
+	to act either as an xbox controller or keyboard and mouse.
+
+	Supported devices:
+	- MSI Claw
+
 config HID_AUREAL
 	tristate "Aureal"
 	help
