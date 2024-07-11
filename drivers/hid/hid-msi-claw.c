@@ -143,10 +143,8 @@ static int msi_claw_probe(struct hid_device *hdev, const struct hid_device_id *i
 		return ret;
 	}
 
-    // TODO: remove me
-    hid_err(hdev, "msi-claw started\n");
 
-    ret = msi_claw_switch_gamepad_mode(hdev, MSI_CLAW_GAMEPAD_MODE_MSI, MSI_CLAW_MKEY_FUNCTION_MACRO);
+    ret = msi_claw_switch_gamepad_mode(hdev, MSI_CLAW_GAMEPAD_MODE_XINPUT, MSI_CLAW_MKEY_FUNCTION_MACRO);
     if (ret != 0) {
         hid_err(hdev, "msi-claw failed to initialize controller mode: %d\n", ret);
 
@@ -155,6 +153,9 @@ static int msi_claw_probe(struct hid_device *hdev, const struct hid_device_id *i
 
         goto err_stop_hw;
     }
+
+    // TODO: remove me
+    hid_err(hdev, "msi-claw started\n");
 
     return 0;
 
