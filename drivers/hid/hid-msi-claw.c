@@ -144,7 +144,7 @@ static int msi_claw_probe(struct hid_device *hdev, const struct hid_device_id *i
 	}
 
     // TODO: remove me
-    hid_err(hdev, "msi-claw started\n", ret);
+    hid_err(hdev, "msi-claw started\n");
 
     ret = msi_claw_switch_gamepad_mode(hdev, MSI_CLAW_GAMEPAD_MODE_MSI, MSI_CLAW_MKEY_FUNCTION_MACRO);
     if (ret != 0) {
