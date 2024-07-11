@@ -59,7 +59,7 @@ static int msi_claw_switch_gamepad_mode(struct hid_device *hdev, enum msi_claw_g
 {
 	int ret;
 	const unsigned char buf[] = {
-		FEATURE_GAMEPAD_REPORT_ID, 0, 0, 60, MSI_CLAW_COMMAND_TYPE_SWITCH_MODE, (unsigned char)mode, (unsigned char)mkeys
+		FEATURE_GAMEPAD_REPORT_ID, 0, 0, 60, MSI_CLAW_COMMAND_TYPE_SWITCH_MODE, (unsigned char)mode, (unsigned char)mkeys, 0
 	};
 	unsigned char *dmabuf = kmemdup(buf, sizeof(buf), GFP_KERNEL);
 
@@ -134,7 +134,7 @@ static int msi_claw_probe(struct hid_device *hdev, const struct hid_device_id *i
     ret = hid_parse(hdev);
 	if (ret) {
 		hid_err(hdev, "msi-claw hid parse failed: %d\n", ret);
-		return ret;
+		return -ENODEV;
 	}
 
     ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT);
@@ -149,6 +149,10 @@ static int msi_claw_probe(struct hid_device *hdev, const struct hid_device_id *i
     ret = msi_claw_switch_gamepad_mode(hdev, MSI_CLAW_GAMEPAD_MODE_MSI, MSI_CLAW_MKEY_FUNCTION_MACRO);
     if (ret != 0) {
         hid_err(hdev, "msi-claw failed to initialize controller mode: %d\n", ret);
+
+        // improve this
+        ret = -ENODEV;
+
         goto err_stop_hw;
     }
 
