@@ -78,7 +78,7 @@ static int msi_claw_switch_gamepad_mode(struct hid_device *hdev, enum msi_claw_g
 		hid_err(hdev, "msi-claw failed to switch controller mode: %d\n", ret);
 
         const unsigned char buf2[] = {
-            0, 0, 60, MSI_CLAW_COMMAND_TYPE_SWITCH_MODE, (unsigned char)mode, (unsigned char)mkeys, 0, 0
+            0, 0, 60, MSI_CLAW_COMMAND_TYPE_SWITCH_MODE, (unsigned char)mode, (unsigned char)mkeys, 0
         };
         dmabuf = kmemdup(buf2, sizeof(buf2), GFP_KERNEL);
 
