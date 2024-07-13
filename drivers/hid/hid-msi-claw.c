@@ -94,12 +94,42 @@ static int msi_claw_switch_gamepad_mode(struct hid_device *hdev, enum msi_claw_g
         kfree(dmabuf);
 
         if (ret != sizeof(buf)) {
-		    hid_err(hdev, "msi-claw failed to switch controller mode (2): %d\n", ret);
+		    hid_err(hdev, "msi-claw failed to switch controller mode (3): %d\n", ret);
+            
+            const unsigned char buf3[] = {
+                0, 0, 60, MSI_CLAW_COMMAND_TYPE_SWITCH_MODE, (unsigned char)mode, (unsigned char)mkeys
+            };
+            dmabuf = kmemdup(buf3, sizeof(buf3), GFP_KERNEL);
+
+            if (!dmabuf) {
+                ret = -ENOMEM;
+                hid_err(hdev, "msi-claw failed to alloc dma buf: %d\n", ret);
+                return ret;
+            }
+
+            ret = hid_hw_raw_request(hdev, FEATURE_GAMEPAD_REPORT_ID, dmabuf, sizeof(buf3),
+                            HID_FEATURE_REPORT, HID_REQ_SET_REPORT);
+
+            kfree(dmabuf);
+
+            if (ret != sizeof(buf)) {
+                hid_err(hdev, "msi-claw failed to switch controller mode (3): %d\n", ret);
+                
+                
+                return ret;
+            } else {
+                return 0;
+            }
+            
             return ret;
+        } else {
+            return 0;
         }
 
 		return ret;
-	}
+	} else {
+        return 0;
+    }
 
 	return 0;
 }
