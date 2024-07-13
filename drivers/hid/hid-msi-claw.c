@@ -59,7 +59,7 @@ static int msi_claw_switch_gamepad_mode(struct hid_device *hdev, enum msi_claw_g
 {
 	int ret;
 	const unsigned char buf[] = {
-		FEATURE_GAMEPAD_REPORT_ID, 0, 0, 60, MSI_CLAW_COMMAND_TYPE_SWITCH_MODE, (unsigned char)mode, (unsigned char)mkeys, 0
+		0, 0, 60, MSI_CLAW_COMMAND_TYPE_SWITCH_MODE, (unsigned char)mode, (unsigned char)mkeys, 0, 0
 	};
 	unsigned char *dmabuf = kmemdup(buf, sizeof(buf), GFP_KERNEL);
 
@@ -69,13 +69,35 @@ static int msi_claw_switch_gamepad_mode(struct hid_device *hdev, enum msi_claw_g
 		return ret;
 	}
 
-	ret = hid_hw_raw_request(hdev, dmabuf[0], dmabuf, sizeof(buf),
+	ret = hid_hw_raw_request(hdev, FEATURE_GAMEPAD_REPORT_ID, dmabuf, sizeof(buf),
 					HID_FEATURE_REPORT, HID_REQ_SET_REPORT);
 
 	kfree(dmabuf);
 
 	if (ret != sizeof(buf)) {
 		hid_err(hdev, "msi-claw failed to switch controller mode: %d\n", ret);
+
+        const unsigned char buf2[] = {
+            0, 0, 60, MSI_CLAW_COMMAND_TYPE_SWITCH_MODE, (unsigned char)mode, (unsigned char)mkeys, 0, 0
+        };
+        dmabuf = kmemdup(buf2, sizeof(buf2), GFP_KERNEL);
+
+        if (!dmabuf) {
+            ret = -ENOMEM;
+            hid_err(hdev, "msi-claw failed to alloc dma buf: %d\n", ret);
+            return ret;
+        }
+
+        ret = hid_hw_raw_request(hdev, FEATURE_GAMEPAD_REPORT_ID, dmabuf, sizeof(buf2),
+                        HID_FEATURE_REPORT, HID_REQ_SET_REPORT);
+
+        kfree(dmabuf);
+
+        if (ret != sizeof(buf)) {
+		    hid_err(hdev, "msi-claw failed to switch controller mode (2): %d\n", ret);
+            return ret;
+        }
+
 		return ret;
 	}
 
@@ -123,6 +145,11 @@ static int msi_claw_probe(struct hid_device *hdev, const struct hid_device_id *i
 	int ret;
 	struct msi_claw_drvdata *drvdata;
 
+    if (!hid_is_usb(hdev)) {
+        hid_err(hdev, "msi-claw hid not usb\n");
+		return -ENODEV;
+    }
+
 	drvdata = devm_kzalloc(&hdev->dev, sizeof(*drvdata), GFP_KERNEL);
 	if (drvdata == NULL) {
 		hid_err(hdev, "msi-claw can't alloc descriptor\n");
@@ -143,6 +170,7 @@ static int msi_claw_probe(struct hid_device *hdev, const struct hid_device_id *i
 		return ret;
 	}
 
+    hid_err(hdev, "msi-claw on %d\n", (int)hdev->rdesc[0]);
 
     ret = msi_claw_switch_gamepad_mode(hdev, MSI_CLAW_GAMEPAD_MODE_XINPUT, MSI_CLAW_MKEY_FUNCTION_MACRO);
     if (ret != 0) {
