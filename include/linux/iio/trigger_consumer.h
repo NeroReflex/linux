@@ -50,4 +50,20 @@ irqreturn_t iio_pollfunc_store_time(int irq, void *p);
 
 void iio_trigger_notify_done(struct iio_trigger *trig);
 
+/**
+ * iio_suspend_triggering() - suspend triggers attached to an iio_dev
+ * @indio_dev: iio_dev associated with the device that will have triggers suspended
+ *
+ * Return 0 if successful, negative otherwise
+ **/
+int iio_suspend_triggering(struct iio_dev *indio_dev);
+
+/**
+ * iio_resume_triggering() - resume triggers attached to an iio_dev that were previously suspended
+ * @indio_dev: iio_dev associated with the device that will have triggers resumed
+ *
+ * Return 0 if successful, negative otherwise
+ **/
+int iio_resume_triggering(struct iio_dev *indio_dev);
+
 #endif
