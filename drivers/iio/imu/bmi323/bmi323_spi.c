@@ -80,6 +80,7 @@ static struct spi_driver bmi323_spi_driver = {
 	.driver = {
 		.name = "bmi323",
 		.of_match_table = bmi323_of_spi_match,
+		.pm = &bmi323_core_pm_ops,
 	},
 	.probe = bmi323_spi_probe,
 	.id_table = bmi323_spi_ids,
