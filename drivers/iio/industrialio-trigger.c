@@ -781,3 +781,45 @@ void iio_device_unregister_trigger_consumer(struct iio_dev *indio_dev)
 	if (indio_dev->trig)
 		iio_trigger_put(indio_dev->trig);
 }
+
+int iio_suspend_triggering(struct iio_dev *indio_dev) {
+	struct iio_dev_opaque *iio_dev_opaque = to_iio_dev_opaque(indio_dev);
+
+	int err = 0;
+
+	mutex_lock(&iio_dev_opaque->mlock);
+
+	if (!indio_dev->pollfunc)
+		goto iio_suspend_triggering_exit;
+
+	if (indio_dev->pollfunc->irq <= 0)
+		goto iio_suspend_triggering_exit;
+
+	disable_irq(indio_dev->pollfunc->irq);
+
+iio_suspend_triggering_exit:
+	mutex_unlock(&iio_dev_opaque->mlock);
+	return err;
+}
+EXPORT_SYMBOL(iio_suspend_triggering);
+
+int iio_resume_triggering(struct iio_dev *indio_dev) {
+	struct iio_dev_opaque *iio_dev_opaque = to_iio_dev_opaque(indio_dev);
+
+	int err = 0;
+
+	mutex_lock(&iio_dev_opaque->mlock);
+
+	if (!indio_dev->pollfunc)
+		goto iio_resume_triggering_exit;
+
+	if (indio_dev->pollfunc->irq <= 0)
+		goto iio_resume_triggering_exit;
+
+	enable_irq(indio_dev->pollfunc->irq);
+
+iio_resume_triggering_exit:
+	mutex_unlock(&iio_dev_opaque->mlock);
+	return 0;
+}
+EXPORT_SYMBOL(iio_resume_triggering);
