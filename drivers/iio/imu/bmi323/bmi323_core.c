@@ -118,11 +118,37 @@ static const struct bmi323_hw bmi323_hw[2] = {
 	},
 };
 
+struct bmi323_sensor_settings {
+	int odr_val;
+	int odr_val2;
+	int scale_val;
+	int scale_val2;
+	int avg_val;
+	enum bmi323_3db_bw bw_val;
+};
+
+struct bmi323_ext_regs_settings {
+	unsigned int reg;
+	unsigned int val;
+	bool resume_restore;
+};
+
+struct bmi323_regs_settings {
+	unsigned int reg;
+	unsigned int val;
+};
+
+#define EXT_SETTING_REGISTERS 8
+#define SETTING_REGISTERS 2
+
 struct bmi323_data {
 	struct device *dev;
 	struct regmap *regmap;
 	struct iio_mount_matrix orientation;
 	enum bmi323_irq_pin irq_pin;
+	bool active_high;
+	bool open_drain;
+	bool latch;
 	struct iio_trigger *trig;
 	bool drdy_trigger_enabled;
 	enum bmi323_state state;
@@ -130,6 +156,12 @@ struct bmi323_data {
 	u32 odrns[BMI323_SENSORS_CNT];
 	u32 odrhz[BMI323_SENSORS_CNT];
 	unsigned int feature_events;
+	struct bmi323_sensor_settings settings[BMI323_SENSORS_CNT];
+	struct bmi323_regs_settings reg_settings[SETTING_REGISTERS];
+	struct bmi323_ext_regs_settings ext_settings[EXT_SETTING_REGISTERS];
+	unsigned int feature_engine_settings;
+	bool feature_engine_settings_changed;
+	
 
 	/*
 	 * Lock to protect the members of device's private data from concurrent
@@ -346,7 +378,21 @@ static int bmi323_write_ext_reg(struct bmi323_data *data, unsigned int ext_addr,
 	if (ret)
 		return ret;
 
-	return regmap_write(data->regmap, BMI323_FEAT_DATA_TX, ext_data);
+	ret = regmap_write(data->regmap, BMI323_FEAT_DATA_TX, ext_data);
+	if (ret)
+		return ret;
+
+	/*
+	 * Save the register if it is meant to be restored by resume pm callback.
+	 */
+	for (unsigned int i = 0; i < EXT_SETTING_REGISTERS; ++i) {
+		if (data->ext_settings[i].reg == ext_addr) {
+			data->ext_settings[i].val = ext_data;
+			data->ext_settings[i].resume_restore = true;
+		}
+	}
+
+	return 0;
 }
 
 /*
@@ -405,6 +451,28 @@ static int bmi323_get_error_status(struct bmi323_data *data)
 	return error;
 }
 
+static int bmi323_feature_engine_events_raw(struct bmi323_data *data,
+					const unsigned int value)
+{
+	int ret;
+
+	/* Register must be cleared before changing an active config */
+	ret = regmap_write(data->regmap, BMI323_FEAT_IO0_REG, 0);
+	if (ret)
+		return ret;
+
+	ret = regmap_write(data->regmap, BMI323_FEAT_IO0_REG, value);
+	if (ret)
+		return ret;
+
+	ret = regmap_write(data->regmap, BMI323_FEAT_IO_STATUS_REG,
+			    BMI323_FEAT_IO_STATUS_MSK);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
 static int bmi323_feature_engine_events(struct bmi323_data *data,
 					const unsigned int event_mask,
 					bool state)
@@ -416,22 +484,19 @@ static int bmi323_feature_engine_events(struct bmi323_data *data,
 	if (ret)
 		return ret;
 
-	/* Register must be cleared before changing an active config */
-	ret = regmap_write(data->regmap, BMI323_FEAT_IO0_REG, 0);
-	if (ret)
-		return ret;
-
 	if (state)
 		value |= event_mask;
 	else
 		value &= ~event_mask;
 
-	ret = regmap_write(data->regmap, BMI323_FEAT_IO0_REG, value);
+	ret = bmi323_feature_engine_events_raw(data, value);
 	if (ret)
 		return ret;
 
-	return regmap_write(data->regmap, BMI323_FEAT_IO_STATUS_REG,
-			    BMI323_FEAT_IO_STATUS_MSK);
+	data->feature_engine_settings = value;
+	data->feature_engine_settings_changed = true;
+
+	return 0;
 }
 
 static int bmi323_step_wtrmrk_en(struct bmi323_data *data, int state)
@@ -1425,6 +1490,8 @@ static int bmi323_set_average(struct bmi323_data *data,
 		return -EINVAL;
 
 	guard(mutex)(&data->mutex);
+	data->settings[sensor].avg_val = avg;
+
 	return regmap_update_bits(data->regmap, bmi323_hw[sensor].config,
 				 BMI323_ACC_GYRO_CONF_AVG_MSK,
 				 FIELD_PREP(BMI323_ACC_GYRO_CONF_AVG_MSK,
@@ -1558,6 +1625,9 @@ static int bmi323_configure_power_mode(struct bmi323_data *data,
 {
 	enum bmi323_opr_mode mode;
 
+	if (sensor >= BMI323_SENSORS_CNT)
+		return -EINVAL;
+
 	if (bmi323_acc_gyro_odr[odr_index][0] > 25)
 		mode = ACC_GYRO_MODE_CONTINOUS;
 	else
@@ -1570,6 +1640,9 @@ static int bmi323_set_odr(struct bmi323_data *data,
 			  enum bmi323_sensor_type sensor, int odr, int uodr)
 {
 	int odr_raw, ret;
+
+	if (sensor >= BMI323_SENSORS_CNT)
+		return -EINVAL;
 
 	odr_raw = ARRAY_SIZE(bmi323_acc_gyro_odr);
 
@@ -1585,6 +1658,8 @@ static int bmi323_set_odr(struct bmi323_data *data,
 		return -EINVAL;
 
 	guard(mutex)(&data->mutex);
+	data->settings[sensor].odr_val = odr;
+	data->settings[sensor].odr_val2 = uodr;
 	data->odrhz[sensor] = bmi323_acc_gyro_odr[odr_raw][0];
 	data->odrns[sensor] = bmi323_acc_gyro_odrns[odr_raw];
 
@@ -1600,6 +1675,8 @@ static int bmi323_get_scale(struct bmi323_data *data,
 			    enum bmi323_sensor_type sensor, int *val2)
 {
 	int ret, value, scale_raw;
+	if (sensor >= BMI323_SENSORS_CNT)
+		return -EINVAL;
 
 	scoped_guard(mutex, &data->mutex) {
 		ret = regmap_read(data->regmap, bmi323_hw[sensor].config,
@@ -1619,6 +1696,9 @@ static int bmi323_set_scale(struct bmi323_data *data,
 {
 	int scale_raw;
 
+	if (sensor >= BMI323_SENSORS_CNT)
+		return -EINVAL;
+
 	scale_raw = bmi323_hw[sensor].scale_table_len;
 
 	while (scale_raw--)
@@ -1629,6 +1709,8 @@ static int bmi323_set_scale(struct bmi323_data *data,
 		return -EINVAL;
 
 	guard(mutex)(&data->mutex);
+	data->settings[sensor].scale_val = val;
+	data->settings[sensor].scale_val2 = val2;
 	return regmap_update_bits(data->regmap, bmi323_hw[sensor].config,
 				  BMI323_ACC_GYRO_CONF_SCL_MSK,
 				  FIELD_PREP(BMI323_ACC_GYRO_CONF_SCL_MSK,
@@ -1922,6 +2004,9 @@ static int bmi323_trigger_probe(struct bmi323_data *data,
 				     "Trigger registration failed\n");
 
 	data->irq_pin = irq_pin;
+	data->latch = latch;
+	data->open_drain = open_drain;
+	data->active_high = active_high;
 
 	return 0;
 }
@@ -1977,12 +2062,15 @@ static void bmi323_disable(void *data_ptr)
 static int bmi323_set_bw(struct bmi323_data *data,
 			 enum bmi323_sensor_type sensor, enum bmi323_3db_bw bw)
 {
+	guard(mutex)(&data->mutex);
+	data->settings[sensor].bw_val = bw;
+
 	return regmap_update_bits(data->regmap, bmi323_hw[sensor].config,
 				  BMI323_ACC_GYRO_CONF_BW_MSK,
 				  FIELD_PREP(BMI323_ACC_GYRO_CONF_BW_MSK, bw));
 }
 
-static int bmi323_init(struct bmi323_data *data)
+static int bmi323_init(struct bmi323_data *data, bool first_init)
 {
 	int ret, val;
 
@@ -2029,6 +2117,9 @@ static int bmi323_init(struct bmi323_data *data)
 	if (val)
 		return dev_err_probe(data->dev, -EINVAL,
 				     "Sensor power error = 0x%x\n", val);
+
+	if (!first_init)
+		return 0;
 
 	/*
 	 * Set the Bandwidth coefficient which defines the 3 dB cutoff
@@ -2078,9 +2169,25 @@ int bmi323_core_probe(struct device *dev)
 	data = iio_priv(indio_dev);
 	data->dev = dev;
 	data->regmap = regmap;
+	data->irq_pin = BMI323_IRQ_DISABLED;
+	data->state = BMI323_IDLE;
+	data->ext_settings[0].reg = BMI323_TAP1_REG;
+	data->ext_settings[1].reg = BMI323_FEAT_IO0_S_TAP_MSK;
+	data->ext_settings[2].reg = BMI323_ANYMO1_REG;
+	data->ext_settings[3].reg = BMI323_NOMO1_REG;
+	data->ext_settings[4].reg = BMI323_ANYMO1_REG + BMI323_MO2_OFFSET;
+	data->ext_settings[5].reg = BMI323_NOMO1_REG + BMI323_MO2_OFFSET;
+	data->ext_settings[6].reg = BMI323_ANYMO1_REG + BMI323_MO3_OFFSET;
+	data->ext_settings[7].reg = BMI323_NOMO1_REG + BMI323_MO3_OFFSET;
+	data->reg_settings[0].reg = BMI323_INT_MAP1_REG;
+	data->reg_settings[1].reg = BMI323_INT_MAP2_REG;
+	data->feature_engine_settings_changed = false;
+	for (int sens = 0; sens < BMI323_SENSORS_CNT; ++sens) {
+		data->settings[sens].avg_val = -1;
+	}
 	mutex_init(&data->mutex);
 
-	ret = bmi323_init(data);
+	ret = bmi323_init(data, true);
 	if (ret)
 		return -EINVAL;
 
@@ -2117,21 +2224,116 @@ int bmi323_core_probe(struct device *dev)
 		return dev_err_probe(data->dev, ret,
 				     "Unable to register iio device\n");
 
-	return 0;
+	return bmi323_fifo_disable(data);
 }
 EXPORT_SYMBOL_NS_GPL(bmi323_core_probe, IIO_BMI323);
+
+void bmi323_core_remove(struct device *dev)
+{
+	struct regmap *const regmap = dev_get_regmap(dev, NULL);
+
+	if (regmap)
+		regmap_write(regmap, BMI323_CMD_REG, BMI323_RST_VAL);
+}
+EXPORT_SYMBOL_NS_GPL(bmi323_core_remove, IIO_BMI323);
 
 #if defined(CONFIG_PM)
 static int bmi323_core_runtime_suspend(struct device *dev)
 {
-	struct iio_dev *indio_dev = dev_get_drvdata(dev);
+	struct iio_dev *const indio_dev = dev_get_drvdata(dev);
+	struct bmi323_data *const data = iio_priv(indio_dev);
 
-	return iio_device_suspend_triggering(indio_dev);
+	int ret = 0;
+
+	guard(mutex)(&data->mutex);
+
+	ret = iio_device_suspend_triggering(indio_dev);
+	if (ret)
+		return ret;
+
+	for (unsigned int reg = 0; reg < SETTING_REGISTERS; ++reg) {
+		ret = regmap_read(data->regmap, data->reg_settings[reg].reg,
+			  &data->reg_settings[reg].val);
+		if (ret)
+			return ret;
+	}
+
+	/*
+	 * Perform soft reset to place the device in its lower power state.
+	 */
+	ret = regmap_write(data->regmap, BMI323_CMD_REG, BMI323_RST_VAL);
+	if (ret)
+		return ret;
+
+	return 0;
 }
 
 static int bmi323_core_runtime_resume(struct device *dev)
 {
-	struct iio_dev *indio_dev = dev_get_drvdata(dev);
+	struct iio_dev *const indio_dev = dev_get_drvdata(dev);
+	struct bmi323_data *const data = iio_priv(indio_dev);
+	const enum bmi323_irq_pin initial_irq_pin =
+		(data->irq_pin == BMI323_IRQ_INT1) ? BMI323_IRQ_INT1 : BMI323_IRQ_INT2;
+
+	int ret = 0;
+
+	/*
+	 * Perform the device power-on and initial setup once again
+	 * after being reset in the lower power state by runtime-pm.
+	 */
+	ret = bmi323_init(data, false);
+	if (!ret)
+		return ret;
+
+	for (int sens = 0; sens < BMI323_SENSORS_CNT; ++sens) {
+		data->settings[sens].avg_val = -1;
+
+		ret = bmi323_set_bw(data, sens, data->settings[sens].bw_val);
+		if (!ret)
+			return ret;
+
+		ret = bmi323_set_odr(data, sens, data->settings[sens].odr_val,
+			  data->settings[sens].odr_val2);
+		if (!ret)
+			return ret;
+
+		ret = bmi323_set_scale(data, sens, data->settings[sens].scale_val,
+			  data->settings[sens].scale_val2);
+		if (!ret)
+			return ret;
+
+		if (data->settings[sens].avg_val != -1) {
+			ret = bmi323_set_average(data, sens, data->settings[sens].avg_val);
+			if (!ret)
+				return ret;
+		}
+	}
+
+	ret = bmi323_int_pin_config(data, initial_irq_pin, data->active_high,
+				  data->open_drain, data->latch);
+	if (!ret)
+		return ret;
+
+	if (data->feature_engine_settings_changed) {
+		bmi323_feature_engine_events_raw(data, data->feature_engine_settings);
+	}
+
+	switch (data->state) {
+		case BMI323_IDLE:
+			bmi323_fifo_disable(data);
+			break;
+
+		case BMI323_BUFFER_FIFO:
+			bmi323_fifo_enable(data);
+			break;
+
+		case BMI323_BUFFER_DRDY_TRIGGERED:
+			scoped_guard(mutex, &data->mutex)
+				bmi323_set_drdy_irq(data, data->irq_pin);
+			break;
+	}
+
+	guard(mutex)(&data->mutex);
 
 	return iio_device_resume_triggering(indio_dev);
 }
