@@ -851,7 +851,14 @@ static ssize_t egpu_enable_store(struct device *dev,
 	if (err)
 		return err;
 
-	if (enable > 1)
+	// 1 = nvidia, 2 = amd, 3 = intel
+	if (enable == 0x0001U)
+		enable = 1;
+	else if (enable == 2)
+		enable == 0x0101U;
+	else if (enable == 3)
+		enable == 0x0201U;
+	else
 		return -EINVAL;
 
 	err = asus_wmi_get_devstate_simple(asus, ASUS_WMI_DEVID_EGPU_CONNECTED);

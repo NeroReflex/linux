@@ -440,7 +440,12 @@ static ssize_t egpu_enable_current_value_store(struct kobject *kobj, struct kobj
 	if (err)
 		return err;
 
-	if (enable > 1)
+	// 1 = nvidia, 2 = amd, 3 = intel
+	if (enable == 0)
+		enable = 0x0000U;
+	else if (enable == 1)
+		enable = 0x0101U;
+	else
 		return -EINVAL;
 
 	err = asus_wmi_get_devstate_dsts(ASUS_WMI_DEVID_EGPU_CONNECTED, &result);
