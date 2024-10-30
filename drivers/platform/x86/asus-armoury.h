@@ -13,6 +13,31 @@
 
 #define DRIVER_NAME "asus-armoury"
 
+enum asus_armoury_egpu_action {
+	asus_armoury_egpu_disable,
+
+	/**
+	 * Model 2021:
+	 *   - Graphics: RTX 2080
+	 *   - Power: 280W
+	 */
+	asus_armoury_egpu_enable_model_2021,
+
+	/**
+	 * Model 2022:
+	 *   - Graphics: Radeon RX 6850XT
+	 *   - Power: 330W
+	 */
+	asus_armoury_egpu_enable_model_2022,
+
+	/**
+	 * Model 2023:
+	 *   - Graphics: RTX 4090
+	 *   - Power: 330W
+	 */
+	asus_armoury_egpu_enable_model_2023,
+};
+
 static ssize_t attr_uint_store(struct kobject *kobj, struct kobj_attribute *attr,
 			      const char *buf, size_t count, u32 min, u32 max,
 			      u32 *store_value, u32 wmi_dev);
@@ -143,7 +168,7 @@ static ssize_t enum_type_show(struct kobject *kobj, struct kobj_attribute *attr,
 
 #define ATTR_GROUP_ENUM_INT_RO(_attrname, _fsname, _wmi, _possible, _dispname) \
 	__ATTR_CURRENT_INT_RO(_attrname, _wmi);                                \
-	__ATTR_GROUP_ENUM(_attrname, _fsname, _possible, _dispname)
+	    __ATTR_GROUP_ENUM(_attrname, _fsname, _possible, _dispname)
 
 /*
  * Requires <name>_current_value_show(), <name>_current_value_show()
