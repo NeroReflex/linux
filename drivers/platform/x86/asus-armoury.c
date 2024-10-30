@@ -436,19 +436,27 @@ static ssize_t dgpu_disable_current_value_store(struct kobject *kobj,
 WMI_SHOW_INT(dgpu_disable_current_value, "%d\n", ASUS_WMI_DEVID_DGPU);
 ATTR_GROUP_BOOL_CUSTOM(dgpu_disable, "dgpu_disable", "Disable the dGPU");
 
-/* The ACPI call to enable the eGPU also disables the internal dGPU */
-static ssize_t egpu_enable_current_value_store(struct kobject *kobj, struct kobj_attribute *attr,
-					       const char *buf, size_t count)
+static ssize_t egpu_change_status(enum asus_armoury_egpu_action egpu_model)
 {
 	int result, err;
-	u32 enable;
+	u32 enable = 0;
 
-	err = kstrtou32(buf, 10, &enable);
-	if (err)
-		return err;
-
-	if (enable > 1)
+	switch (egpu_model) {
+	case asus_armoury_egpu_disable:
+		enable = 0x00000000U;
+		break;
+	case asus_armoury_egpu_enable_model_2021:
+		enable = 0x00000001U;
+		break;
+	case asus_armoury_egpu_enable_model_2022:
+		enable = 0x00000101U;
+		break;
+	case asus_armoury_egpu_enable_model_2023:
+		enable = 0x00000201U;
+		break;
+	default:
 		return -EINVAL;
+	}
 
 	err = asus_wmi_get_devstate_dsts(ASUS_WMI_DEVID_EGPU_CONNECTED, &result);
 	if (err) {
@@ -469,16 +477,100 @@ static ssize_t egpu_enable_current_value_store(struct kobject *kobj, struct kobj
 		}
 	}
 
-	err = armoury_wmi_set_devstate(attr, enable, ASUS_WMI_DEVID_EGPU);
+	guard(mutex)(&asus_armoury.mutex);
+	err = asus_wmi_set_devstate(ASUS_WMI_DEVID_EGPU, enable, &result);
+	if (err) {
+		pr_err("Failed to enable the eGPU: wmi error %d\n", err);
+		return err;
+	}
+	/* !1 is considered a fail by ASUS */
+	if (result != 1) {
+		pr_err("Failed to enable the eGPU: wmi result is 0x%x\n", result);
+		return -EIO;
+	}
+
+	return 0;
+}
+
+/* The ACPI call to enable the eGPU also disables the internal dGPU */
+static ssize_t egpu_enable_current_value_store(struct kobject *kobj, struct kobj_attribute *attr,
+					       const char *buf, size_t count)
+{
+	int err;
+	u32 requested;
+	enum asus_armoury_egpu_action act;
+
+	err = kstrtou32(buf, 10, &requested);
 	if (err)
 		return err;
+
+	switch (requested) {
+	case 0:
+		act = asus_armoury_egpu_disable;
+		break;
+	case 1:
+		act = asus_armoury_egpu_enable_model_2021;
+		break;
+	case 2:
+		act = asus_armoury_egpu_enable_model_2022;
+		break;
+	case 3:
+		act = asus_armoury_egpu_enable_model_2023;
+		break;
+	default:
+		err = -EINVAL;
+	}
+	
+	err = egpu_change_status(act);
+	if (err) {
+		pr_err("Failed to set %s: %d\n", attr->attr.name, err);
+		return err;
+	}
 
 	sysfs_notify(kobj, NULL, attr->attr.name);
 
 	return count;
 }
-WMI_SHOW_INT(egpu_enable_current_value, "%d\n", ASUS_WMI_DEVID_EGPU);
-ATTR_GROUP_BOOL_CUSTOM(egpu_enable, "egpu_enable", "Enable the eGPU (also disables dGPU)");
+
+static ssize_t egpu_enable_current_value_show(struct kobject *kobj, struct kobj_attribute *attr,
+					  char *buf)
+{
+	int err;
+	u32 status;
+
+	err = asus_wmi_get_devstate_dsts(ASUS_WMI_DEVID_EGPU, &status);
+	if (err) {
+		pr_warn("Failed to get eGPU connection status: %d\n", err);
+		return err;
+	}
+
+	switch (status) {
+	case 0x00000000U:
+		status = 0;
+		break;
+	case 0x00000001U:
+		status = 1;
+		break;
+	case 0x00000101U:
+		status = 2;
+		break;
+	case 0x00000201U:
+		status = 3;
+		break;
+	default:
+		pr_warn("Failed to get eGPU connection status: %d\n", err);
+		return -EINVAL;
+	}
+
+	return sysfs_emit(buf, "%u\n", status);
+}
+
+static ssize_t egpu_enable_possible_values_show(struct kobject *kobj, struct kobj_attribute *attr,
+					    char *buf)
+{
+	return sysfs_emit(buf, "0;1;2;3\n");
+}
+ATTR_GROUP_ENUM_CUSTOM(egpu_enable, "egpu_enable", "Enable the eGPU (also disables dGPU)");
 
 /* Device memory available to APU */
 
