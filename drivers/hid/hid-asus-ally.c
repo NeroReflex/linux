@@ -37,7 +37,7 @@
 #define ALLY_MIN_BIOS 319
 #define ALLY_X_MIN_BIOS 313
 
-#define BTN_DATA_LEN 11;
+#define BTN_DATA_LEN 10;
 #define BTN_CODE_BYTES_LEN 8
 
 static const u8 EC_INIT_STRING[] = { 0x5A, 'A', 'S', 'U', 'S', ' ', 'T', 'e','c', 'h', '.', 'I', 'n', 'c', '.', '\0' };
@@ -203,9 +203,17 @@ static const size_t keymap_len = ARRAY_SIZE(ally_btn_codes);
 /* byte_array must be >= 8 in length */
 static void btn_code_to_byte_array(u64 keycode, u8 *byte_array)
 {
-	for (int i = 0; i < BTN_CODE_BYTES_LEN; ++i) {
+	/*for (int i = 0; i < BTN_CODE_BYTES_LEN; i++) {
 		byte_array[i] = (keycode >> (8 * (BTN_CODE_BYTES_LEN - 1 - i))) & 0xFF;
-	}
+	}*/
+    byte_array[0] = (keycode >> 56) & 0xFF;  // Most significant byte
+    byte_array[1] = (keycode >> 48) & 0xFF;
+    byte_array[2] = (keycode >> 40) & 0xFF;
+    byte_array[3] = (keycode >> 32) & 0xFF;
+    byte_array[4] = (keycode >> 24) & 0xFF;
+    byte_array[5] = (keycode >> 16) & 0xFF;
+    byte_array[6] = (keycode >>  8) & 0xFF;
+    byte_array[7] = (keycode      ) & 0xFF;  // Least significant byte
 }
 
 static u64 name_to_btn(const char *name)
@@ -961,6 +969,7 @@ static void _btn_pair_to_hid_pkt(struct ally_gamepad_cfg *ally_cfg,
 	btn_code_to_byte_array(btn2->button, &out[index]);
 	index += BTN_DATA_LEN;
 	btn_code_to_byte_array(btn2->macro, &out[index]);
+	print_hex_dump(KERN_DEBUG, "byte_array: ", DUMP_PREFIX_OFFSET, 64, 1, out, 64, false);
 }
 
 /* Apply the mapping pair to the device */
