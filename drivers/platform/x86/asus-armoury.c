@@ -23,6 +23,7 @@
 #include <linux/platform_data/x86/asus-wmi.h>
 #include <linux/types.h>
 #include <linux/acpi.h>
+#include <linux/pci.h>
 
 #include "asus-armoury.h"
 #include "firmware_attributes_class.h"
@@ -440,6 +441,7 @@ static ssize_t egpu_change_status(enum asus_armoury_egpu_action egpu_model)
 {
 	int result, err;
 	u32 enable = 0;
+	struct pci_bus *b = NULL;
 
 	switch (egpu_model) {
 	case asus_armoury_egpu_disable:
@@ -483,11 +485,22 @@ static ssize_t egpu_change_status(enum asus_armoury_egpu_action egpu_model)
 		pr_err("Failed to enable the eGPU: wmi error %d\n", err);
 		return err;
 	}
-	/* !1 is considered a fail by ASUS */
-	if (result != 1) {
+	/* 0x01 is a success while 0x02 is a partial activation needing a reboot */
+	if (result == 0x01) {
+		pr_debug("Success enabling the eGPU\n");
+	} else if (result == 0x02) {
+		pr_info("Success enabling the eGPU, a reboot is strongly advised\n");
+		asus_set_reboot_and_signal_event();
+	} else {
 		pr_err("Failed to enable the eGPU: wmi result is 0x%x\n", result);
 		return -EIO;
 	}
+
+	/* Perform a PCI rescan: this is necessary when result is 0x02 */
+	pci_lock_rescan_remove();
+	while ((b = pci_find_next_bus(b)) != NULL)
+		pci_rescan_bus(b);
+	pci_unlock_rescan_remove();
 
 	return 0;
 }
