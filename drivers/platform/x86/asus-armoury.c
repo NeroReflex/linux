@@ -25,6 +25,8 @@
 #include <linux/types.h>
 #include <linux/acpi.h>
 #include <linux/pci.h>
+#include <linux/kthread.h>
+#include <linux/delay.h>
 
 #include "asus-armoury.h"
 #include "firmware_attributes_class.h"
@@ -94,6 +96,8 @@ struct asus_armoury_priv {
 
 	enum asus_armoury_egpu_action egpu_last_successful_action;
 
+	struct task_struct *egpu_kthread;
+
 	struct mutex egpu_mutex;
 
 	struct mutex mutex;
@@ -103,6 +107,7 @@ static const struct class *fw_attr_class;
 
 static struct asus_armoury_priv asus_armoury = {
 	.egpu_last_successful_action = asus_armoury_egpu_max,
+	.egpu_kthread = NULL,
 	.egpu_mutex = __MUTEX_INITIALIZER(asus_armoury.mutex),
 	.mutex = __MUTEX_INITIALIZER(asus_armoury.mutex)
 };
@@ -119,6 +124,10 @@ struct asus_attr_group {
 	const struct attribute_group *attr_group;
 	u32 wmi_devid;
 };
+
+static int auto_xgm = 0;
+module_param(auto_xgm, int, 1);
+MODULE_PARM_DESC(auto_xgm, "XGm auto-activation value: 0=off, otherwise a value supported by egpu_enable");
 
 static bool asus_wmi_is_present(u32 dev_id)
 {
@@ -471,6 +480,16 @@ static ssize_t egpu_change_status(enum asus_armoury_egpu_action egpu_action)
 	return result;
 }
 
+/* Perform a PCI rescan: sometimes this is necessary after activating the eGPU */
+static void pci_rescan_after_egpu_change_status(void) {
+	struct pci_bus *b = NULL;
+
+	pci_lock_rescan_remove();
+	while ((b = pci_find_next_bus(b)) != NULL)
+		pci_rescan_bus(b);
+	pci_unlock_rescan_remove();
+}
+
 /* The ACPI call to enable the eGPU also disables the internal dGPU */
 static ssize_t egpu_enable_current_value_store(struct kobject *kobj, struct kobj_attribute *attr,
 							const char *buf, size_t count)
@@ -478,7 +497,6 @@ static ssize_t egpu_enable_current_value_store(struct kobject *kobj, struct kobj
 	int err;
 	u32 requested;
 	enum asus_armoury_egpu_action act;
-	struct pci_bus *b = NULL;
 
 	err = kstrtou32(buf, 10, &requested);
 	if (err)
@@ -509,11 +527,7 @@ static ssize_t egpu_enable_current_value_store(struct kobject *kobj, struct kobj
 		return err;
 	}
 
-	/* Perform a PCI rescan: sometimes this is necessary */
-	pci_lock_rescan_remove();
-	while ((b = pci_find_next_bus(b)) != NULL)
-		pci_rescan_bus(b);
-	pci_unlock_rescan_remove();
+	pci_rescan_after_egpu_change_status();
 
 	sysfs_notify(kobj, NULL, attr->attr.name);
 
@@ -1140,6 +1154,65 @@ static bool init_rog_tunables(struct rog_tunables *rog)
 	return true;
 }
 
+static int egpu_activation_poll_kthread(void *data) {
+	int err = 0;
+	u32 result;
+
+	while (!kthread_should_stop()) {
+		ssleep(5);
+
+		if (err) continue;
+
+		scoped_guard(mutex, &asus_armoury.egpu_mutex) {
+			
+			/* If the eGPU has been manually disabled avoid re-activating it */
+			if (asus_armoury.egpu_last_successful_action == asus_armoury_egpu_disable)
+				continue;
+
+			err = asus_wmi_get_devstate_dsts(ASUS_WMI_DEVID_EGPU_CONNECTED, &result);
+			if (err) {
+				pr_warn("Failed to get eGPU connection status: %d\n", err);
+				continue;
+			}
+
+			/* eGPU interface is a stub: ignore the following */
+			if ((result & ASUS_WMI_DSTS_PRESENCE_BIT) == 0) continue;
+
+			/* eGPU is not connected: ignore the following */
+			if ((result & ~ASUS_WMI_DSTS_PRESENCE_BIT) == 0) continue;
+
+			err = asus_wmi_get_devstate_dsts(ASUS_WMI_DEVID_EGPU, &result);
+			if (err) {
+				pr_warn("Failed to get eGPU connection status: %d\n", err);
+				continue;
+			}
+
+			/* If the eGPU was activated on the previous boot
+			 * do not perform useless ACPI operations
+			 * and update egpu_last_successful_action
+			 * so that the behavior will match a successfully
+			 * activated eGPU in the current boot skipping a
+			 * repeated and useless ASUS_WMI_DEVID_EGPU check.
+			 */
+			if ((result & ~ASUS_WMI_DSTS_PRESENCE_BIT) != 0) {
+				asus_armoury.egpu_last_successful_action = asus_armoury_egpu_enable;
+			}
+
+			err = egpu_change_status((enum asus_armoury_egpu_action)auto_xgm);
+		}
+
+		if (err < 0) {
+			pr_err("Failed to hotplug activate asus egpu: %d\n", err);
+		} else {
+			pci_rescan_after_egpu_change_status();
+		}
+	}
+
+	pr_info("asus egpu kthread threminated.\n");
+
+	return 0;
+}
+
 static int __init asus_fw_init(void)
 {
 	char *wmi_uid;
@@ -1184,11 +1257,30 @@ static int __init asus_fw_init(void)
 	if (err)
 		return err;
 
+	if ((auto_xgm >= 1) && (auto_xgm <= 3)) {
+		pr_info("xgm auto-activation enabled with %d\n", auto_xgm);
+
+		if ((asus_wmi_is_present(ASUS_WMI_DEVID_EGPU)) && (asus_wmi_is_present(ASUS_WMI_DEVID_EGPU_CONNECTED))) {
+			asus_armoury.egpu_kthread = kthread_run(egpu_activation_poll_kthread, NULL, "asus_egpu_kthread");
+			if (IS_ERR(asus_armoury.egpu_kthread)) {
+				pr_err("Failed to create kernel thread: xg auto-activation is disabled\n");
+			}
+		}
+	} else {
+		pr_info("xgm auto-activation has been disabled\n");
+	}
+
 	return 0;
 }
 
 static void __exit asus_fw_exit(void)
 {
+	if ((auto_xgm >= 1) && (auto_xgm <= 3))
+		if ((asus_armoury.egpu_kthread) && (!IS_ERR(asus_armoury.egpu_kthread)))
+			kthread_stop(asus_armoury.egpu_kthread);
+
+	mutex_lock(&asus_armoury.egpu_mutex);
+
 	mutex_lock(&asus_armoury.mutex);
 
 	sysfs_remove_file(&asus_armoury.fw_attr_kset->kobj, &pending_reboot.attr);
@@ -1197,6 +1289,7 @@ static void __exit asus_fw_exit(void)
 	fw_attributes_class_put();
 
 	mutex_unlock(&asus_armoury.mutex);
+	mutex_unlock(&asus_armoury.egpu_mutex);
 }
 
 module_init(asus_fw_init);
