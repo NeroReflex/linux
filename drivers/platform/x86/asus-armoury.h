@@ -14,6 +14,14 @@
 
 #define DRIVER_NAME "asus-armoury"
 
+enum asus_armoury_egpu_action {
+	asus_armoury_egpu_disable,
+	asus_armoury_egpu_enable,
+	asus_armoury_egpu_enable_special,
+	asus_armoury_egpu_enable_special_2,
+	asus_armoury_egpu_max
+};
+
 static ssize_t attr_uint_store(struct kobject *kobj, struct kobj_attribute *attr,
 			      const char *buf, size_t count, u32 min, u32 max,
 			      u32 *store_value, u32 wmi_dev);
