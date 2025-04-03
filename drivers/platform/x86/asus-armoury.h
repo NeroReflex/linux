@@ -14,6 +14,14 @@
 
 #define DRIVER_NAME "asus-armoury"
 
+enum asus_armoury_egpu_action {
+	asus_armoury_egpu_disable,
+	asus_armoury_egpu_enable,
+	asus_armoury_egpu_enable_special,
+	asus_armoury_egpu_enable_special_2,
+	asus_armoury_egpu_max
+};
+
 #define __ASUS_ATTR_RO(_func, _name)					\
 	{								\
 		.attr = { .name = __stringify(_name), .mode = 0444 },	\

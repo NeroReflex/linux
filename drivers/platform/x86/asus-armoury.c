@@ -20,6 +20,7 @@
 #include <linux/kobject.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/pci.h>
 #include <linux/platform_data/x86/asus-wmi.h>
 #include <linux/power_supply.h>
 #include <linux/types.h>
@@ -106,8 +107,14 @@ static struct asus_armoury_priv {
 	 * endpoint at the same time. Must lock during attr store.
 	 */
 	struct mutex cpu_core_mutex;
+
+	/*
+	 * Mutex to prevent concurrent attempt to enable/disable the egpu.
+	 */
+	struct mutex egpu_mutex;
 } asus_armoury = {
-	.cpu_core_mutex = __MUTEX_INITIALIZER(asus_armoury.cpu_core_mutex)
+	.cpu_core_mutex = __MUTEX_INITIALIZER(asus_armoury.cpu_core_mutex),
+	.egpu_mutex = __MUTEX_INITIALIZER(asus_armoury.egpu_mutex)
 };
 
 struct fw_attrs_group {
@@ -416,19 +423,27 @@ static ssize_t dgpu_disable_current_value_store(struct kobject *kobj,
 WMI_SHOW_INT(dgpu_disable_current_value, "%d\n", ASUS_WMI_DEVID_DGPU);
 ATTR_GROUP_BOOL_CUSTOM(dgpu_disable, "dgpu_disable", "Disable the dGPU");
 
-/* The ACPI call to enable the eGPU also disables the internal dGPU */
-static ssize_t egpu_enable_current_value_store(struct kobject *kobj, struct kobj_attribute *attr,
-					       const char *buf, size_t count)
+static ssize_t egpu_change_status(enum asus_armoury_egpu_action egpu_action)
 {
 	int result, err;
 	u32 enable;
 
-	err = kstrtou32(buf, 10, &enable);
-	if (err)
-		return err;
-
-	if (enable > 1)
+	switch (egpu_action) {
+	case asus_armoury_egpu_disable:
+		enable = 0x00000000U;
+		break;
+	case asus_armoury_egpu_enable:
+		enable = 0x00000001U;
+		break;
+	case asus_armoury_egpu_enable_special:
+		enable = 0x00000101U;
+		break;
+	case asus_armoury_egpu_enable_special_2:
+		enable = 0x00000201U;
+		break;
+	default:
 		return -EINVAL;
+	}
 
 	err = asus_wmi_get_devstate_dsts(ASUS_WMI_DEVID_EGPU_CONNECTED, &result);
 	if (err) {
@@ -442,22 +457,145 @@ static ssize_t egpu_enable_current_value_store(struct kobject *kobj, struct kobj
 			pr_warn("Failed to get GPU MUX status: %d\n", result);
 			return result;
 		}
-		if (!result && enable) {
+		if (!(result & ~ASUS_WMI_DSTS_PRESENCE_BIT) && enable) {
 			pr_warn("Can not enable eGPU when the MUX is in dGPU mode\n");
 			return -ENODEV;
 		}
 	}
 
-	err = armoury_wmi_set_devstate(attr, enable, ASUS_WMI_DEVID_EGPU);
+	err = asus_wmi_set_devstate(ASUS_WMI_DEVID_EGPU, enable, &result);
+	if (err) {
+		pr_err("Failed to enable the eGPU: wmi error %d\n", err);
+		return err;
+	}
+
+	/*
+	 * ACPI returns value 0x01 on success, 0x02 on a partial activation:
+	 * performing a pci rescan will bring up the device in pci-e 3.0 speed,
+	 * after a reboot the device will work at full speed: signal the need
+	 * to reboot.
+	 */
+	if (result == 0x01) {
+		/*
+		 * When a GPU is in use it does not get disconnected, even if the ACPI
+		 * call returns a success: return -EBUSY if that happens.
+		 */
+		if (egpu_action == asus_armoury_egpu_disable) {
+			err = asus_wmi_get_devstate_dsts(ASUS_WMI_DEVID_EGPU, &result);
+			if (err) {
+				pr_warn("Failed to get eGPU connection status after supposed deactivation: %d\n", err);
+				return err;
+			}
+
+			if ((result & ~ASUS_WMI_DSTS_PRESENCE_BIT) != 0x00)
+				return -EBUSY;
+		}
+
+		pr_debug("Success changing the eGPU status\n");
+	} else if (result == 0x02) {
+		pr_info("Success changing the eGPU status, a reboot is strongly advised\n");
+		asus_set_reboot_and_signal_event();
+	} else {
+		pr_err("Failed to change the eGPU status: wmi result is 0x%x\n", result);
+		return -EIO;
+	}
+
+	return result;
+}
+
+/* The ACPI call to enable the eGPU also disables the internal dGPU */
+static ssize_t egpu_enable_current_value_store(struct kobject *kobj, struct kobj_attribute *attr,
+							const char *buf, size_t count)
+{
+	int err;
+	u32 requested;
+	enum asus_armoury_egpu_action act;
+	struct pci_bus *b = NULL;
+
+	err = kstrtou32(buf, 10, &requested);
 	if (err)
 		return err;
+
+	switch (requested) {
+	case 0:
+		act = asus_armoury_egpu_disable;
+		break;
+	case 1:
+		act = asus_armoury_egpu_enable;
+		break;
+	case 2:
+		act = asus_armoury_egpu_enable_special;
+		break;
+	case 3:
+		act = asus_armoury_egpu_enable_special_2;
+		break;
+	default:
+		err = -EINVAL;
+		return err;
+	}
+
+	scoped_guard(mutex, &asus_armoury.egpu_mutex)
+		err = egpu_change_status(act);
+	if (err < 0) {
+		pr_err("Failed to set %s: %d\n", attr->attr.name, err);
+		return err;
+	}
+
+	/* Perform a PCI rescan: sometimes this is necessary */
+	pci_lock_rescan_remove();
+	while ((b = pci_find_next_bus(b)) != NULL)
+		pci_rescan_bus(b);
+	pci_unlock_rescan_remove();
 
 	sysfs_notify(kobj, NULL, attr->attr.name);
 
 	return count;
 }
-WMI_SHOW_INT(egpu_enable_current_value, "%d\n", ASUS_WMI_DEVID_EGPU);
-ATTR_GROUP_BOOL_CUSTOM(egpu_enable, "egpu_enable", "Enable the eGPU (also disables dGPU)");
+
+static ssize_t egpu_enable_current_value_show(struct kobject *kobj, struct kobj_attribute *attr,
+					  char *buf)
+{
+	int err;
+	u32 status;
+
+	scoped_guard(mutex, &asus_armoury.egpu_mutex)
+		err = asus_wmi_get_devstate_dsts(ASUS_WMI_DEVID_EGPU, &status);
+	if (err) {
+		pr_warn("Failed to get eGPU connection status: %d\n", err);
+		return err;
+	}
+
+	if ((status & ASUS_WMI_DSTS_PRESENCE_BIT) == 0) {
+		return -ENODEV;
+	}
+
+	switch (status & ~ASUS_WMI_DSTS_PRESENCE_BIT) {
+	case 0x00000000U:
+		status = 0;
+		break;
+	case 0x00000001U:
+		status = 1;
+		break;
+	case 0x00000101U:
+		status = 2;
+		break;
+	case 0x00000201U:
+		status = 3;
+		break;
+	default:
+		pr_warn("Unrecognised eGPU status: %u\n", status);
+		return -EINVAL;
+	}
+
+	return sysfs_emit(buf, "%u\n", status);
+}
+
+static ssize_t egpu_enable_possible_values_show(struct kobject *kobj, struct kobj_attribute *attr,
+					    char *buf)
+{
+	return sysfs_emit(buf, "0;1;2;3\n");
+}
+ATTR_GROUP_ENUM_CUSTOM(egpu_enable, "egpu_enable", "Enable the eGPU (also disables dGPU)");
 
 /* Device memory available to APU */
 
