@@ -176,6 +176,11 @@ struct ally_config {
 	u8 left_trigger_max;
 	u8 right_trigger_min;
 	u8 right_trigger_max;
+
+	/* Vibration settings */
+	u8 vibration_intensity_left;
+	u8 vibration_intensity_right;
+	bool vibration_active;
 };
 
 struct ally_handheld {
@@ -633,8 +638,132 @@ static ssize_t xbox_controller_store(struct device *dev,
 
 static DEVICE_ATTR_RW(xbox_controller);
 
+/**
+ * ally_set_vibration_intensity() - Set vibration intensity values
+ * @hdev: HID device
+ * @cfg: Ally config
+ * @left: Left motor intensity (0-100)
+ * @right: Right motor intensity (0-100)
+ *
+ * Returns 0 on success, negative error code on failure
+ */
+static int ally_set_vibration_intensity(struct hid_device *hdev, struct ally_config *cfg,
+					u8 left, u8 right)
+{
+	u8 payload[] = { left, right };
+	int ret;
+
+	u8 *buf __free(kfree) = ally_alloc_cmd(CMD_SET_VIBRATION_INTENSITY, payload, sizeof(payload));
+	if (!buf)
+		return -ENOMEM;
+
+	ret = ally_dev_set_report(hdev, buf, ROG_ALLY_REPORT_SIZE);
+	if (ret < 0) {
+		hid_err(hdev, "Failed to set vibration intensity: %d\n", ret);
+		return ret;
+	}
+
+	return 0;
+}
+
+static ssize_t vibration_intensity_left_show(struct device *dev, struct device_attribute *attr,
+					char *buf)
+{
+	struct hid_device *hdev = to_hid_device(dev);
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	struct ally_handheld *ally = drvdata->rog_ally;
+	struct ally_config *cfg;
+
+	if (!ally || !ally->config)
+		return -ENODEV;
+
+	cfg = ally->config;
+
+	return sprintf(buf, "%u\n", cfg->vibration_intensity_left);
+}
+
+static ssize_t vibration_intensity_left_store(struct device *dev, struct device_attribute *attr,
+					 const char *buf, size_t count)
+{
+	struct hid_device *hdev = to_hid_device(dev);
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	struct ally_handheld *ally = drvdata->rog_ally;
+	struct ally_config *cfg;
+	u8 value;
+	int ret;
+
+	if (!ally || !ally->config)
+		return -ENODEV;
+
+	cfg = ally->config;
+
+	ret = kstrtou8(buf, 10, &value);
+	if (ret || value > 100)
+		return -EINVAL;
+
+	ret = ally_set_vibration_intensity(hdev, cfg, value, cfg->vibration_intensity_right);
+	if (ret < 0)
+		return ret;
+
+	scoped_guard(mutex, &cfg->config_mutex)
+		cfg->vibration_intensity_left = value;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(vibration_intensity_left);
+
+static ssize_t vibration_intensity_right_show(struct device *dev, struct device_attribute *attr,
+					char *buf)
+{
+	struct hid_device *hdev = to_hid_device(dev);
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	struct ally_handheld *ally = drvdata->rog_ally;
+	struct ally_config *cfg;
+
+	if (!ally || !ally->config)
+		return -ENODEV;
+
+	cfg = ally->config;
+
+	return sprintf(buf, "%u\n", cfg->vibration_intensity_right);
+}
+
+static ssize_t vibration_intensity_right_store(struct device *dev, struct device_attribute *attr,
+					 const char *buf, size_t count)
+{
+	struct hid_device *hdev = to_hid_device(dev);
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	struct ally_handheld *ally = drvdata->rog_ally;
+	struct ally_config *cfg;
+	u8 value;
+	int ret;
+
+	if (!ally || !ally->config)
+		return -ENODEV;
+
+	cfg = ally->config;
+
+	ret = kstrtou8(buf, 10, &value);
+	if (ret || value > 100)
+		return -EINVAL;
+
+	ret = ally_set_vibration_intensity(hdev, cfg, cfg->vibration_intensity_left, value);
+	if (ret < 0)
+		return ret;
+
+	scoped_guard(mutex, &cfg->config_mutex)
+		cfg->vibration_intensity_right = value;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(vibration_intensity_right);
+
 static struct attribute *ally_config_attrs[] = {
 	&dev_attr_xbox_controller.attr,
+	&dev_attr_vibration_intensity_left.attr,
+	&dev_attr_vibration_intensity_right.attr,
 	NULL
 };
 
@@ -680,6 +809,9 @@ static struct ally_config *ally_config_create(struct hid_device *hdev, struct al
 	cfg->left_outer_threshold = 90;
 	cfg->right_deadzone = 10;
 	cfg->right_outer_threshold = 90;
+	cfg->vibration_intensity_left = 100;
+	cfg->vibration_intensity_right = 100;
+	cfg->vibration_active = false;
 
 	/* So far the only hardware this is supported is the Ally 1 */
 	if (cfg->xbox_controller_support) {
