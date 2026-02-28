@@ -129,6 +129,19 @@ MODULE_DESCRIPTION("Asus HID Keyboard and TouchPad");
 
 #define TRKID_SGN       ((TRKID_MAX + 1) >> 1)
 
+#define ALLY_DEVICE_ATTR_RO(_name, _sysfs_name)    \
+	struct device_attribute dev_attr_##_name = \
+		__ATTR(_sysfs_name, 0444, _name##_show, NULL)
+
+#define ALLY_DEVICE_CONST_ATTR_RO(fname, sysfs_name, value)			\
+	static ssize_t fname##_show(struct device *dev,				\
+				   struct device_attribute *attr, char *buf)	\
+	{									\
+		return sprintf(buf, value);					\
+	}									\
+	struct device_attribute dev_attr_##fname =				\
+		__ATTR(sysfs_name, 0444, fname##_show, NULL)
+
 struct asus_kbd_leds {
 	struct asus_hid_listener listener;
 	struct hid_device *hdev;
@@ -760,6 +773,228 @@ static ssize_t vibration_intensity_right_store(struct device *dev, struct device
 
 static DEVICE_ATTR_RW(vibration_intensity_right);
 
+/**
+ * ally_set_joystick_thresholds() - Generic function to set joystick ranges
+ *
+ * This function send the command to set both inner and outer threshold for
+ * the left and right joysticks.
+ *
+ * @hdev: HID device
+ * @left_dz: deadzone of the left stick/trigger (0-255)
+ * @left_it: Second parameter
+ * @right_it: deadzone of the right stick/trigger (0-255)
+ * @right_ot: Fourth parameter
+ *
+ * Returns 0 on success, negative error code on failure
+ */
+static int ally_set_joystick_thresholds(struct hid_device *hdev, u8 left_it, u8 left_ot,
+					       u8 right_it, u8 right_ot)
+{
+	u8 payload[] = { left_it, left_ot, right_it, right_ot };
+	int ret;
+
+	u8 *buf __free(kfree) = ally_alloc_cmd(CMD_SET_JOYSTICK_DEADZONE, payload, sizeof(payload));
+	if (!buf)
+		return -ENOMEM;
+
+	ret = ally_dev_set_report(hdev, buf, ROG_ALLY_REPORT_SIZE);
+	if (ret < 0) {
+		hid_err(hdev, "Failed to set joystick ranges: %d\n", ret);
+		return ret;
+	}
+
+	return 0;
+}
+
+static ssize_t left_joystick_inner_threshold_show(struct device *dev, struct device_attribute *attr,
+				      char *buf)
+{
+	struct hid_device *hdev = to_hid_device(dev);
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	struct ally_handheld *const ally = drvdata->rog_ally;
+
+	if (!ally || !ally->config)
+		return -ENODEV;
+
+	return sprintf(buf, "%hhu\n", ally->config->left_deadzone);
+}
+
+static ssize_t left_joystick_inner_threshold_store(struct device *dev,
+				       struct device_attribute *attr,
+				       const char *buf, size_t count)
+{
+	struct hid_device *hdev = to_hid_device(dev);
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	struct ally_handheld *const ally = drvdata->rog_ally;
+	u8 value;
+	int ret;
+
+	if (!ally || !ally->config)
+		return -ENODEV;
+
+	ret = kstrtou8(buf, 10, &value);
+	if (ret || value > 50)
+		return -EINVAL;
+
+	ret = ally_set_joystick_thresholds(hdev,
+					   value,
+					   ally->config->left_outer_threshold,
+					   ally->config->right_deadzone,
+					   ally->config->right_outer_threshold);
+	if (ret)
+		return ret;
+
+	scoped_guard(mutex, &ally->config->config_mutex)
+		ally->config->left_deadzone = value;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(left_joystick_inner_threshold);
+
+static ssize_t left_joystick_outer_threshold_show(struct device *dev, struct device_attribute *attr,
+				      char *buf)
+{
+	struct hid_device *hdev = to_hid_device(dev);
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	struct ally_handheld *const ally = drvdata->rog_ally;
+
+	if (!ally || !ally->config)
+		return -ENODEV;
+
+	return sprintf(buf, "%hhu\n", ally->config->left_outer_threshold);
+}
+
+static ssize_t left_joystick_outer_threshold_store(struct device *dev,
+				       struct device_attribute *attr,
+				       const char *buf, size_t count)
+{
+	struct hid_device *hdev = to_hid_device(dev);
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	struct ally_handheld *const ally = drvdata->rog_ally;
+	u8 value;
+	int ret;
+
+	if (!ally || !ally->config)
+		return -ENODEV;
+
+	ret = kstrtou8(buf, 10, &value);
+	if (ret || value < 70 || value > 100)
+		return -EINVAL;
+
+	ret = ally_set_joystick_thresholds(hdev,
+					   ally->config->left_deadzone,
+					   value,
+					   ally->config->right_deadzone,
+					   ally->config->right_outer_threshold);
+	if (ret)
+		return ret;
+
+	scoped_guard(mutex, &ally->config->config_mutex)
+		ally->config->left_outer_threshold = value;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(left_joystick_outer_threshold);
+
+static ssize_t right_joystick_inner_threshold_show(struct device *dev, struct device_attribute *attr,
+				      char *buf)
+{
+	struct hid_device *hdev = to_hid_device(dev);
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	struct ally_handheld *const ally = drvdata->rog_ally;
+
+	if (!ally || !ally->config)
+		return -ENODEV;
+
+	return sprintf(buf, "%hhu\n", ally->config->right_deadzone);
+}
+
+static ssize_t right_joystick_inner_threshold_store(struct device *dev,
+				       struct device_attribute *attr,
+				       const char *buf, size_t count)
+{
+	struct hid_device *hdev = to_hid_device(dev);
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	struct ally_handheld *const ally = drvdata->rog_ally;
+	u8 value;
+	int ret;
+
+	if (!ally || !ally->config)
+		return -ENODEV;
+
+	ret = kstrtou8(buf, 10, &value);
+	if (ret || value > 50)
+		return -EINVAL;
+
+	ret = ally_set_joystick_thresholds(hdev,
+					   ally->config->left_deadzone,
+					   ally->config->left_outer_threshold,
+					   value,
+					   ally->config->right_outer_threshold);
+	if (ret)
+		return ret;
+
+	scoped_guard(mutex, &ally->config->config_mutex)
+		ally->config->right_deadzone = value;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(right_joystick_inner_threshold);
+
+static ssize_t right_joystick_outer_threshold_show(struct device *dev, struct device_attribute *attr,
+				      char *buf)
+{
+	struct hid_device *hdev = to_hid_device(dev);
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	struct ally_handheld *const ally = drvdata->rog_ally;
+
+	if (!ally || !ally->config)
+		return -ENODEV;
+
+	return sprintf(buf, "%hhu\n", ally->config->right_outer_threshold);
+}
+
+static ssize_t right_joystick_outer_threshold_store(struct device *dev,
+				       struct device_attribute *attr,
+				       const char *buf, size_t count)
+{
+	struct hid_device *hdev = to_hid_device(dev);
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	struct ally_handheld *const ally = drvdata->rog_ally;
+	u8 value;
+	int ret;
+
+	if (!ally || !ally->config)
+		return -ENODEV;
+
+	ret = kstrtou8(buf, 10, &value);
+	if (ret || value < 70 || value > 100)
+		return -EINVAL;
+
+	ret = ally_set_joystick_thresholds(hdev,
+					   ally->config->left_deadzone,
+					   ally->config->left_outer_threshold,
+					   ally->config->right_deadzone,
+					   value);
+	if (ret)
+		return ret;
+
+	scoped_guard(mutex, &ally->config->config_mutex)
+		ally->config->right_outer_threshold = value;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(right_joystick_outer_threshold);
+
+ALLY_DEVICE_CONST_ATTR_RO(left_joystick_inner_threshold_min, inner_threshold_min, "0\n");
+ALLY_DEVICE_CONST_ATTR_RO(left_joystick_inner_threshold_max, inner_threshold_max, "50\n");
+ALLY_DEVICE_CONST_ATTR_RO(right_joystick_outer_threshold_min, outer_threshold_min, "70\n");
+ALLY_DEVICE_CONST_ATTR_RO(right_joystick_outer_threshold_max, outer_threshold_max, "100\n");
+
 static struct attribute *ally_config_attrs[] = {
 	&dev_attr_xbox_controller.attr,
 	&dev_attr_vibration_intensity_left.attr,
@@ -767,9 +1002,33 @@ static struct attribute *ally_config_attrs[] = {
 	NULL
 };
 
+static struct attribute *left_joystick_axis_attrs[] = {
+	&dev_attr_left_joystick_inner_threshold.attr,
+	&dev_attr_left_joystick_outer_threshold.attr,
+	&dev_attr_left_joystick_inner_threshold_min.attr,
+	&dev_attr_left_joystick_inner_threshold_max.attr,
+	NULL
+};
+
+static struct attribute *right_joystick_axis_attrs[] = {
+	&dev_attr_right_joystick_inner_threshold.attr,
+	&dev_attr_right_joystick_outer_threshold.attr,
+	&dev_attr_right_joystick_outer_threshold_min.attr,
+	&dev_attr_right_joystick_outer_threshold_max.attr,
+	NULL
+};
+
 static const struct attribute_group ally_attr_groups[] = {
 	{
 		.attrs = ally_config_attrs,
+	},
+	{
+		.name = "left_joystick_axis",
+		.attrs = left_joystick_axis_attrs,
+	},
+	{
+		.name = "right_joystick_axis",
+		.attrs = right_joystick_axis_attrs,
 	},
 };
 
