@@ -996,6 +996,146 @@ ALLY_DEVICE_CONST_ATTR_RO(right_joystick_outer_threshold_min, outer_threshold_mi
 ALLY_DEVICE_CONST_ATTR_RO(right_joystick_outer_threshold_max, outer_threshold_max, "100\n");
 
 /**
+ * ally_set_anti_deadzone - Set anti-deadzone values for joysticks
+ * @ally: ally handheld structure
+ * @left_adz: Left joystick anti-deadzone value (0-100)
+ * @right_adz: Right joystick anti-deadzone value (0-100)
+ *
+ * Return: 0 on success, negative on failure
+ */
+static int ally_set_anti_deadzone(struct hid_device *hdev, u8 left_adz, u8 right_adz)
+{
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	struct ally_handheld *const ally = drvdata->rog_ally;
+	u8 payload[] = { left_adz, right_adz };
+	int ret;
+
+	u8 *buf __free(kfree) = ally_alloc_cmd(CMD_SET_ANTI_DEADZONE, payload, sizeof(payload));
+	if (!buf)
+		return -ENOMEM;
+
+	if (!ally->config->anti_deadzone_support) {
+		hid_dbg(hdev, "Anti-deadzone not supported on this device\n");
+		return -EOPNOTSUPP;
+	}
+
+	ret = ally_dev_set_report(hdev, buf, ROG_ALLY_REPORT_SIZE);
+	if (ret < 0) {
+		hid_err(hdev, "Failed to set anti-deadzone values: %d\n", ret);
+		return ret;
+	}
+
+	return 0;
+}
+
+static ssize_t left_joystick_anti_deadzone_show(struct device *dev, struct device_attribute *attr,
+						char *buf)
+{
+	struct hid_device *hdev = to_hid_device(dev);
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	struct ally_handheld *const ally = drvdata->rog_ally;
+
+	if (!ally || !ally->config)
+		return -ENODEV;
+
+	if (!ally->config->anti_deadzone_support) {
+		hid_dbg(hdev, "Anti-deadzone not supported on this device\n");
+		return -EOPNOTSUPP;
+	}
+
+	return sprintf(buf, "%hhu\n", ally->config->left_anti_deadzone);
+}
+
+static ssize_t left_joystick_anti_deadzone_store(struct device *dev, struct device_attribute *attr,
+						 const char *buf, size_t count)
+{
+	struct hid_device *hdev = to_hid_device(dev);
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	struct ally_handheld *const ally = drvdata->rog_ally;
+	u8 value;
+	int ret;
+
+	if (!ally || !ally->config)
+		return -ENODEV;
+
+	if (!ally->config->anti_deadzone_support) {
+		hid_dbg(hdev, "Anti-deadzone not supported on this device\n");
+		return -EOPNOTSUPP;
+	}
+
+	ret = kstrtou8(buf, 10, &value);
+	if (ret || value > 100)
+		return -EINVAL;
+
+	ret = ally_set_anti_deadzone(hdev, ally->config->left_anti_deadzone, value);
+	if (ret)
+		return ret;
+
+	scoped_guard(mutex, &ally->config->config_mutex)
+		ally->config->left_anti_deadzone = value;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(left_joystick_anti_deadzone);
+
+static ssize_t right_joystick_anti_deadzone_show(struct device *dev, struct device_attribute *attr,
+						char *buf)
+{
+	struct hid_device *hdev = to_hid_device(dev);
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	struct ally_handheld *const ally = drvdata->rog_ally;
+
+	if (!ally || !ally->config)
+		return -ENODEV;
+
+	if (!ally->config->anti_deadzone_support) {
+		hid_dbg(hdev, "Anti-deadzone not supported on this device\n");
+		return -EOPNOTSUPP;
+	}
+
+	return sprintf(buf, "%hhu\n", ally->config->right_anti_deadzone);
+}
+
+static ssize_t right_joystick_anti_deadzone_store(struct device *dev, struct device_attribute *attr,
+						 const char *buf, size_t count)
+{
+	struct hid_device *hdev = to_hid_device(dev);
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	struct ally_handheld *const ally = drvdata->rog_ally;
+	u8 value;
+	int ret;
+
+	if (!ally || !ally->config)
+		return -ENODEV;
+
+	if (!ally->config->anti_deadzone_support) {
+		hid_dbg(hdev, "Anti-deadzone not supported on this device\n");
+		return -EOPNOTSUPP;
+	}
+
+	ret = kstrtou8(buf, 10, &value);
+	if (ret || value > 100)
+		return -EINVAL;
+
+	ret = ally_set_anti_deadzone(hdev, value, ally->config->right_anti_deadzone);
+	if (ret)
+		return ret;
+
+	scoped_guard(mutex, &ally->config->config_mutex)
+		ally->config->right_anti_deadzone = value;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(right_joystick_anti_deadzone);
+
+ALLY_DEVICE_CONST_ATTR_RO(left_joystick_anti_deadzone_min, inner_threshold_min, "0\n");
+ALLY_DEVICE_CONST_ATTR_RO(left_joystick_anti_deadzone_max, inner_threshold_max, "100\n");
+ALLY_DEVICE_CONST_ATTR_RO(right_joystick_anti_deadzone_min, outer_threshold_min, "0\n");
+ALLY_DEVICE_CONST_ATTR_RO(right_joystick_anti_deadzone_max, outer_threshold_max, "100\n");
+
+/**
  * ally_set_trigger_ranges() - Generic function to set triggers ranges
  *
  * This function send the command to set both inner and outer threshold for
@@ -1224,6 +1364,9 @@ static struct attribute *left_joystick_axis_attrs[] = {
 	&dev_attr_left_joystick_outer_threshold.attr,
 	&dev_attr_left_joystick_inner_threshold_min.attr,
 	&dev_attr_left_joystick_inner_threshold_max.attr,
+	&dev_attr_left_joystick_anti_deadzone.attr,
+	&dev_attr_left_joystick_anti_deadzone_min.attr,
+	&dev_attr_left_joystick_anti_deadzone_max.attr,
 	NULL
 };
 
@@ -1232,6 +1375,9 @@ static struct attribute *right_joystick_axis_attrs[] = {
 	&dev_attr_right_joystick_outer_threshold.attr,
 	&dev_attr_right_joystick_outer_threshold_min.attr,
 	&dev_attr_right_joystick_outer_threshold_max.attr,
+	&dev_attr_right_joystick_anti_deadzone.attr,
+	&dev_attr_right_joystick_anti_deadzone_min.attr,
+	&dev_attr_right_joystick_anti_deadzone_max.attr,
 	NULL
 };
 
