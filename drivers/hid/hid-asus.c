@@ -37,6 +37,7 @@
 #include <linux/stddef.h>
 #include <linux/sysfs.h>
 #include <linux/leds.h>
+#include <linux/led-class-multicolor.h>
 
 #include "hid-ids.h"
 
@@ -123,6 +124,46 @@ MODULE_DESCRIPTION("Asus HID Keyboard and TouchPad");
 #define QUIRK_ROG_ALLY_XPAD		BIT(13)
 #define QUIRK_HID_FN_LOCK		BIT(14)
 
+/* Ally LED report commands (Report ID 0x5a) */
+#define ALLY_LED_CMD_CONFIG	0xb3
+#define ALLY_LED_CMD_APPLY	0xb4
+#define ALLY_LED_CMD_SET	0xb5
+
+/* Ally LED brightness report (Report ID 0x5d) */
+#define ALLY_LED_BRIGHTNESS_CMD1	0xba
+#define ALLY_LED_BRIGHTNESS_CMD2	0xc5
+#define ALLY_LED_BRIGHTNESS_CMD3	0xc4
+
+/* Ally LED effect speed (hardware register values) */
+#define ALLY_LED_SPEED_SLOW	0xe1	/* ~13 seconds per cycle */
+#define ALLY_LED_SPEED_MED	0xe4	/* ~9 seconds per cycle */
+#define ALLY_LED_SPEED_FAST	0xef	/* ~5 seconds per cycle */
+
+enum ally_rgb_effect {
+	ALLY_RGB_EFFECT_STATIC		= 0,
+	ALLY_RGB_EFFECT_BREATHING	= 1,
+	ALLY_RGB_EFFECT_COLOR_CYCLE	= 2,
+	ALLY_RGB_EFFECT_RAINBOW		= 3,
+	ALLY_RGB_EFFECT_COUNT,
+};
+
+/* Ally LED effect packet (Report ID 0x5a, command 0xb3) */
+struct ally_rgb_report {
+	u8 report_id;		/* FEATURE_KBD_REPORT_ID (0x5a) */
+	u8 cmd;			/* ALLY_LED_CMD_CONFIG (0xb3) */
+	u8 zone;		/* LED zone (0x00 = all) */
+	u8 effect;		/* enum ally_rgb_effect value */
+	u8 red;			/* red color component */
+	u8 green;		/* green color component */
+	u8 blue;		/* blue color component */
+	u8 speed;		/* animation speed (ALLY_LED_SPEED_*) */
+	u8 direction;		/* 0x01 = forward */
+	u8 pad1;
+	u8 bg_red;		/* background red (0x00 = off) */
+	u8 bg_green;		/* background green */
+	u8 bg_blue;		/* background blue */
+} __packed;
+
 #define I2C_KEYBOARD_QUIRKS			(QUIRK_FIX_NOTEBOOK_REPORT | \
 						 QUIRK_NO_INIT_REPORTS | \
 						 QUIRK_NO_CONSUMER_USAGES)
@@ -172,6 +213,45 @@ struct asus_touchpad_info {
 	int report_size;
 };
 
+/* ROG Ally LED ring device (one per physical controller) */
+struct ally_rgb_dev {
+	struct hid_device *hdev;
+	struct led_classdev_mc led_rgb_dev;
+	struct delayed_work work;
+	struct delayed_work resume_work;
+	bool output_worker_initialized;
+	/* protects: removed, update_rgb, update_effect */
+	spinlock_t lock;
+	bool removed;
+	bool update_rgb;
+	bool update_effect;
+	/* Last 0x5d hardware level; -1 forces resend. */
+	int last_hw_level;
+};
+
+/*
+ * Persistent LED state - survives suspend/resume and device re-creation.
+ *
+ * The ROG Ally X fully re-probes (destroys and recreates) the USB device on
+ * resume. All devm-managed memory including the led_classdev, subled_info,
+ * and mc_subled intensity/brightness fields are freed during this process.
+ * This module-level cache is the only mechanism to restore LED state across
+ * a suspend/resume cycle on this hardware.
+ */
+struct ally_rgb_data {
+	enum ally_rgb_effect mode;
+	u8 speed;		/* 0-100, mapped to 3 discrete HW levels in apply_effect */
+	/*
+	 * Minimal intensity cache needed to survive Ally X USB re-probe.
+	 * The Multicolor LED framework does not restore subled intensities
+	 * to new device instances automatically.
+	 */
+	u8 red;
+	u8 green;
+	u8 blue;
+	bool enabled;
+	bool initialized;
+};
 struct ally_joystick_resp_curve_param {
 	u8 move;
 	u8 resp;
@@ -360,6 +440,10 @@ struct ally_handheld {
 	struct delayed_work resume_work;
 
 	struct ally_config *config;
+
+	/* Ally joystick ring RGB control */
+	struct ally_rgb_dev *led_rgb_dev;
+	struct ally_rgb_data led_rgb_data;
 };
 
 struct asus_drvdata {
@@ -3652,6 +3736,540 @@ static bool hid_asus_ally_raw_event(struct hid_device *hdev, struct ally_handhel
 	return false;
 }
 
+/******************************************************************************/
+/* ROG Ally LED ring control                                                  */
+/******************************************************************************/
+
+/*
+ * The ROG Ally LED controller supports 4 discrete brightness levels (0-3).
+ * Aura animations (Rainbow/Color Cycle) ignore R/G/B bytes and only
+ * respond to this global brightness command.
+ */
+static int ally_rgb_apply_brightness(struct ally_rgb_dev *led_rgb)
+{
+	int br = led_rgb->led_rgb_dev.led_cdev.brightness;
+	u8 buf[] = { FEATURE_KBD_LED_REPORT_ID1, ALLY_LED_BRIGHTNESS_CMD1,
+		     ALLY_LED_BRIGHTNESS_CMD2, ALLY_LED_BRIGHTNESS_CMD3, 0x00 };
+	u8 level;
+	int ret;
+
+	if (ally_drvdata.led_rgb_data.mode == ALLY_RGB_EFFECT_STATIC) {
+		/* Dimming in static mode uses software scaling; hardware level fixed at max. */
+		level = 3;
+	} else {
+		/* Map 0-100 to 0-3 hardware levels for animations */
+		if (br == 0 || !ally_drvdata.led_rgb_data.enabled)
+			level = 0;
+		else if (br <= 33)
+			level = 1;
+		else if (br <= 66)
+			level = 2;
+		else
+			level = 3;
+	}
+
+	/* Send brightness report only on level changes; may be NV-backed. */
+	if (level == led_rgb->last_hw_level)
+		return 0;
+
+	buf[4] = level;
+
+	ret = ally_dev_set_report(led_rgb->hdev, buf, sizeof(buf));
+	if (ret >= 0)
+		led_rgb->last_hw_level = level;
+
+	return ret;
+}
+
+static int ally_rgb_apply_effect(struct ally_rgb_dev *led_rgb)
+{
+	static const u8 speed_lut[] = {
+		ALLY_LED_SPEED_SLOW, ALLY_LED_SPEED_MED, ALLY_LED_SPEED_FAST
+	};
+	struct ally_rgb_report rpt = {
+		.report_id = FEATURE_KBD_REPORT_ID,
+		.cmd = ALLY_LED_CMD_CONFIG,
+		.zone = 0x00,
+		.effect = ally_drvdata.led_rgb_data.mode,
+		/*
+		 * Unscaled intensity, not the scaled .brightness: animation
+		 * dimming is the 4-level 0x5d hardware control, so scaled
+		 * values here would dim twice.
+		 */
+		.red = led_rgb->led_rgb_dev.subled_info[0].intensity,
+		.green = led_rgb->led_rgb_dev.subled_info[1].intensity,
+		.blue = led_rgb->led_rgb_dev.subled_info[2].intensity,
+	};
+	u8 set_buf[ROG_ALLY_REPORT_SIZE] = {
+		FEATURE_KBD_REPORT_ID, ALLY_LED_CMD_SET
+	};
+	u8 buf[ROG_ALLY_REPORT_SIZE] = {};
+	int ret;
+
+	if (!led_rgb || !led_rgb->hdev)
+		return -ENODEV;
+
+	if (ally_drvdata.led_rgb_data.mode != ALLY_RGB_EFFECT_STATIC) {
+		u8 idx;
+
+		if (ally_drvdata.led_rgb_data.speed <= 33)
+			idx = 0;
+		else if (ally_drvdata.led_rgb_data.speed <= 66)
+			idx = 1;
+		else
+			idx = 2;
+
+		rpt.speed = speed_lut[idx];
+		rpt.direction = 0x01;
+	}
+
+	memcpy(buf, &rpt, sizeof(rpt));
+
+	ret = ally_dev_set_report(led_rgb->hdev, buf, ROG_ALLY_REPORT_SIZE);
+	if (ret < 0)
+		return ret;
+
+	/* Config (0xb3) stages; SET (0xb5) applies; APPLY (0xb4) commits to NV on suspend. */
+	return ally_dev_set_report(led_rgb->hdev, set_buf, sizeof(set_buf));
+}
+
+/*
+ * Volatile per-zone color set (code page 0xd1, CMD_LED_CONTROL). This is the
+ * packet the upstream hid-asus-ally driver streams for all live updates; it
+ * bypasses the Aura effect engine and the MCU's non-volatile storage, so it
+ * is safe to send at slider rate. Zone order: left-bottom, left-top,
+ * right-bottom, right-top.
+ */
+static int ally_rgb_send_direct(struct ally_rgb_dev *led_rgb,
+				u8 red, u8 green, u8 blue)
+{
+	u8 buf[16] = { FEATURE_KBD_REPORT_ID, HID_ALLY_FEATURE_CODE_PAGE,
+		       CMD_LED_CONTROL, 0x0c };
+	int i;
+
+	for (i = 0; i < 4; i++) {
+		buf[4 + i * 3] = red;
+		buf[5 + i * 3] = green;
+		buf[6 + i * 3] = blue;
+	}
+
+	return ally_dev_set_report(led_rgb->hdev, buf, sizeof(buf));
+}
+
+/*
+ * Persist the active LED config to MCU non-volatile storage so it is shown
+ * at power-on. Each call costs an MCU flash write cycle: call only from the
+ * suspend path (mirroring ally_pm_suspend in the upstream hid-asus-ally
+ * driver), never from the update hot path.
+ */
+static int ally_rgb_commit(struct ally_rgb_dev *led_rgb)
+{
+	u8 apply_buf[ROG_ALLY_REPORT_SIZE] = {
+		FEATURE_KBD_REPORT_ID, ALLY_LED_CMD_APPLY
+	};
+
+	return ally_dev_set_report(led_rgb->hdev, apply_buf, sizeof(apply_buf));
+}
+
+static void ally_rgb_set(struct led_classdev *cdev, enum led_brightness brightness)
+{
+	struct led_classdev_mc *mc_cdev = lcdev_to_mccdev(cdev);
+	struct ally_rgb_dev *led = container_of(mc_cdev, struct ally_rgb_dev, led_rgb_dev);
+
+	/* Scale subled intensity by master brightness for static modes. */
+	led_mc_calc_color_components(mc_cdev, brightness);
+
+	scoped_guard(spinlock_irqsave, &led->lock) {
+		led->update_rgb = true;
+		/* Update effect flag if color changed; brightness changes affect hardware level. */
+		if (mc_cdev->subled_info[0].intensity != ally_drvdata.led_rgb_data.red ||
+		    mc_cdev->subled_info[1].intensity != ally_drvdata.led_rgb_data.green ||
+		    mc_cdev->subled_info[2].intensity != ally_drvdata.led_rgb_data.blue)
+			led->update_effect = true;
+	}
+
+	ally_drvdata.led_rgb_data.red = mc_cdev->subled_info[0].intensity;
+	ally_drvdata.led_rgb_data.green = mc_cdev->subled_info[1].intensity;
+	ally_drvdata.led_rgb_data.blue = mc_cdev->subled_info[2].intensity;
+	ally_drvdata.led_rgb_data.initialized = true;
+	queue_delayed_work(system_wq, &led->work, msecs_to_jiffies(30));
+}
+
+static void ally_rgb_work_fn(struct work_struct *work)
+{
+	struct ally_rgb_dev *led = container_of(work, struct ally_rgb_dev, work.work);
+	bool update_rgb, update_effect;
+	int ret;
+
+	scoped_guard(spinlock_irqsave, &led->lock) {
+		if (led->removed)
+			return;
+		update_rgb = led->update_rgb;
+		update_effect = led->update_effect;
+		led->update_rgb = false;
+		led->update_effect = false;
+	}
+
+	if (!update_rgb && !update_effect)
+		return;
+
+	ret = ally_rgb_apply_brightness(led);
+	if (ret < 0) {
+		dev_err(&led->hdev->dev, "Failed to apply RGB brightness: %d\n", ret);
+		return;
+	}
+
+	if (ally_drvdata.led_rgb_data.mode == ALLY_RGB_EFFECT_STATIC) {
+		/*
+		 * Static colors stream on the volatile direct path. The Aura
+		 * effect engine (and its NV-backed config) is never touched
+		 * here; dimming and "off" are software RGB scaling.
+		 */
+		if (ally_drvdata.led_rgb_data.enabled)
+			ret = ally_rgb_send_direct(led,
+				led->led_rgb_dev.subled_info[0].brightness,
+				led->led_rgb_dev.subled_info[1].brightness,
+				led->led_rgb_dev.subled_info[2].brightness);
+		else
+			ret = ally_rgb_send_direct(led, 0, 0, 0);
+		if (ret < 0)
+			dev_err(&led->hdev->dev, "Failed to set direct RGB: %d\n", ret);
+	} else if (update_effect) {
+		ret = ally_rgb_apply_effect(led);
+		if (ret < 0)
+			dev_err(&led->hdev->dev, "Failed to apply RGB effect: %d\n", ret);
+	}
+}
+
+/*
+ * Route sysfs-triggered updates through the throttled worker. Sending from
+ * the store callbacks directly would bypass rate limiting and interleave
+ * with the worker's own packet sequences.
+ */
+static void ally_rgb_queue_update(bool effect_changed)
+{
+	struct ally_rgb_dev *led = ally_drvdata.led_rgb_dev;
+
+	if (!led)
+		return;
+
+	scoped_guard(spinlock_irqsave, &led->lock) {
+		if (led->removed)
+			return;
+		led->update_rgb = true;
+		if (effect_changed)
+			led->update_effect = true;
+	}
+	queue_delayed_work(system_wq, &led->work, msecs_to_jiffies(30));
+}
+
+static void ally_rgb_resume_work_fn(struct work_struct *work)
+{
+	struct ally_rgb_dev *led_rgb = container_of(work, struct ally_rgb_dev, resume_work.work);
+	struct mc_subled *mc_led_info;
+	struct led_classdev *led_cdev;
+
+	if (!led_rgb || led_rgb->removed)
+		return;
+
+	led_cdev = &led_rgb->led_rgb_dev.led_cdev;
+	mc_led_info = led_rgb->led_rgb_dev.subled_info;
+
+	if (ally_drvdata.led_rgb_data.initialized) {
+		/* MCU rebooted; reset last_hw_level and schedule full update. */
+		led_rgb->last_hw_level = -1;
+		scoped_guard(spinlock_irqsave, &led_rgb->lock) {
+			led_rgb->update_rgb = true;
+			led_rgb->update_effect = true;
+		}
+		queue_delayed_work(system_wq, &led_rgb->work, 0);
+	}
+
+}
+
+/* Resume LEDs after suspend - called from hid_asus_ally_reset_resume */
+static void ally_rgb_resume(void)
+{
+	struct ally_rgb_dev *led_rgb = ally_drvdata.led_rgb_dev;
+
+	if (!led_rgb)
+		return;
+
+	if (ally_drvdata.led_rgb_data.initialized) {
+		/* Defer execution so USB reset_resume finishes and MCU is ready */
+		schedule_delayed_work(&led_rgb->resume_work, msecs_to_jiffies(1500));
+	}
+}
+
+/* Ally RGB sysfs attributes */
+
+static const char *const ally_rgb_effect_strings[] = {
+	[ALLY_RGB_EFFECT_STATIC]	= "monocolor",
+	[ALLY_RGB_EFFECT_BREATHING]	= "breathe",
+	[ALLY_RGB_EFFECT_COLOR_CYCLE]	= "chroma",
+	[ALLY_RGB_EFFECT_RAINBOW]	= "rainbow",
+};
+
+static ssize_t effect_show(struct device *dev,
+			   struct device_attribute *attr, char *buf)
+{
+	enum ally_rgb_effect mode = ally_drvdata.led_rgb_data.mode;
+
+	if (mode >= ARRAY_SIZE(ally_rgb_effect_strings))
+		return -EINVAL;
+	return sysfs_emit(buf, "%s\n", ally_rgb_effect_strings[mode]);
+}
+
+static ssize_t effect_store(struct device *dev,
+			    struct device_attribute *attr,
+			    const char *buf, size_t count)
+{
+	int mode = sysfs_match_string(ally_rgb_effect_strings, buf);
+
+	if (mode < 0)
+		return mode;
+
+	ally_drvdata.led_rgb_data.mode = mode;
+	ally_rgb_queue_update(true);
+
+	return count;
+}
+
+static ssize_t effect_index_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	int i, len = 0;
+
+	for (i = 0; i < ARRAY_SIZE(ally_rgb_effect_strings); i++)
+		len += sysfs_emit_at(buf, len, "%s%s",
+				     i ? " " : "", ally_rgb_effect_strings[i]);
+	len += sysfs_emit_at(buf, len, "\n");
+	return len;
+}
+
+static ssize_t speed_show(struct device *dev,
+			  struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%d\n", ally_drvdata.led_rgb_data.speed);
+}
+
+static ssize_t speed_store(struct device *dev,
+			   struct device_attribute *attr,
+			   const char *buf, size_t count)
+{
+	int ret;
+	u8 speed;
+
+	ret = kstrtou8(buf, 10, &speed);
+	if (ret)
+		return ret;
+
+	if (speed > 100)
+		return -EINVAL;
+
+	ally_drvdata.led_rgb_data.speed = speed;
+	ally_rgb_queue_update(true);
+
+	return count;
+}
+
+static ssize_t speed_range_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "0-100\n");
+}
+
+static ssize_t profile_show(struct device *dev,
+			    struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "1\n");
+}
+
+static ssize_t profile_store(struct device *dev,
+			     struct device_attribute *attr,
+			     const char *buf, size_t count)
+{
+	return count;
+}
+
+static ssize_t profile_range_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "1-3\n");
+}
+
+static ssize_t enabled_show(struct device *dev,
+			    struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%d\n", ally_drvdata.led_rgb_data.enabled);
+}
+
+static ssize_t enabled_store(struct device *dev,
+			     struct device_attribute *attr,
+			     const char *buf, size_t count)
+{
+	bool enabled;
+	int ret = kstrtobool(buf, &enabled);
+
+	if (ret)
+		return ret;
+
+	ally_drvdata.led_rgb_data.enabled = enabled;
+	ally_rgb_queue_update(false);
+
+	return count;
+}
+
+static ssize_t enabled_index_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "0 1\n");
+}
+
+static DEVICE_ATTR_RW(effect);
+static DEVICE_ATTR_RO(effect_index);
+static DEVICE_ATTR_RW(speed);
+static DEVICE_ATTR_RO(speed_range);
+static DEVICE_ATTR_RW(profile);
+static DEVICE_ATTR_RO(profile_range);
+static DEVICE_ATTR_RW(enabled);
+static DEVICE_ATTR_RO(enabled_index);
+
+static struct attribute *ally_rgb_attrs[] = {
+	&dev_attr_effect.attr,
+	&dev_attr_effect_index.attr,
+	&dev_attr_speed.attr,
+	&dev_attr_speed_range.attr,
+	&dev_attr_profile.attr,
+	&dev_attr_profile_range.attr,
+	&dev_attr_enabled.attr,
+	&dev_attr_enabled_index.attr,
+	NULL,
+};
+
+static struct attribute_group ally_rgb_attr_group = {
+	.attrs = ally_rgb_attrs,
+};
+
+static int ally_rgb_register(struct hid_device *hdev, struct ally_rgb_dev *led_rgb)
+{
+	struct mc_subled *mc_led_info;
+	struct led_classdev *led_cdev;
+	int ret;
+
+	mc_led_info = devm_kmalloc_array(&hdev->dev, 3, sizeof(*mc_led_info),
+					 GFP_KERNEL | __GFP_ZERO);
+	if (!mc_led_info)
+		return -ENOMEM;
+
+	mc_led_info[0].color_index = LED_COLOR_ID_RED;
+	mc_led_info[1].color_index = LED_COLOR_ID_GREEN;
+	mc_led_info[2].color_index = LED_COLOR_ID_BLUE;
+
+	led_rgb->led_rgb_dev.subled_info = mc_led_info;
+	led_rgb->led_rgb_dev.num_colors = 3;
+
+	led_cdev = &led_rgb->led_rgb_dev.led_cdev;
+	led_cdev->brightness = 50;
+	led_cdev->name = "asus:rgb:joystick_rings";
+	led_cdev->max_brightness = 100;
+	led_cdev->brightness_set = ally_rgb_set;
+	led_cdev->color = LED_COLOR_ID_RGB;
+
+	/*
+	 * Restore saved intensities after Ally X re-probe. The Multicolor
+	 * LED framework treats this as a fresh device and zeros intensities.
+	 */
+	if (ally_drvdata.led_rgb_data.initialized) {
+		mc_led_info[0].intensity = ally_drvdata.led_rgb_data.red;
+		mc_led_info[1].intensity = ally_drvdata.led_rgb_data.green;
+		mc_led_info[2].intensity = ally_drvdata.led_rgb_data.blue;
+	}
+
+	/* Initialize scaled brightness values */
+	led_mc_calc_color_components(&led_rgb->led_rgb_dev, led_cdev->brightness);
+
+	/* Effect mode/speed are restored via ally_drvdata; brightness uses defaults */
+
+	ret = devm_led_classdev_multicolor_register(&hdev->dev, &led_rgb->led_rgb_dev);
+	if (ret)
+		return ret;
+
+	ret = devm_device_add_group(led_rgb->led_rgb_dev.led_cdev.dev,
+				     &ally_rgb_attr_group);
+	if (ret && ret != -EEXIST)
+		return ret;
+
+	return 0;
+}
+
+static struct ally_rgb_dev *ally_rgb_create(struct hid_device *hdev)
+{
+	struct ally_rgb_dev *led_rgb;
+	int ret;
+
+	led_rgb = devm_kzalloc(&hdev->dev, sizeof(struct ally_rgb_dev), GFP_KERNEL);
+	if (!led_rgb)
+		return ERR_PTR(-ENOMEM);
+
+	led_rgb->hdev = hdev;
+	led_rgb->removed = false;
+
+	INIT_DELAYED_WORK(&led_rgb->work, ally_rgb_work_fn);
+	INIT_DELAYED_WORK(&led_rgb->resume_work, ally_rgb_resume_work_fn);
+	led_rgb->output_worker_initialized = true;
+	led_rgb->last_hw_level = -1;
+	spin_lock_init(&led_rgb->lock);
+
+	ret = ally_rgb_register(hdev, led_rgb);
+	if (ret < 0) {
+		cancel_delayed_work_sync(&led_rgb->work);
+		cancel_delayed_work_sync(&led_rgb->resume_work);
+		devm_kfree(&hdev->dev, led_rgb);
+		return ERR_PTR(ret);
+	}
+
+	/* Initialize state if not already done */
+	if (!ally_drvdata.led_rgb_data.initialized)
+		ally_drvdata.led_rgb_data.enabled = true;
+
+	ally_rgb_apply_brightness(led_rgb);
+
+	/* Re-apply saved state after MCU re-init (suspend/resume) */
+	if (ally_drvdata.led_rgb_data.initialized) {
+		schedule_delayed_work(&led_rgb->resume_work, msecs_to_jiffies(1500));
+	}
+
+	return led_rgb;
+}
+
+static void ally_rgb_remove(struct hid_device *hdev)
+{
+	struct ally_rgb_dev *led_rgb = ally_drvdata.led_rgb_dev;
+	int ep;
+
+	ep = ally_get_endpoint_address(hdev);
+	if (ep != HID_ALLY_INTF_CFG_IN)
+		return;
+
+	if (!led_rgb || led_rgb->removed)
+		return;
+
+	scoped_guard(spinlock_irqsave, &led_rgb->lock) {
+		led_rgb->removed = true;
+		led_rgb->output_worker_initialized = false;
+	}
+	cancel_delayed_work_sync(&led_rgb->work);
+	cancel_delayed_work_sync(&led_rgb->resume_work);
+	devm_led_classdev_multicolor_unregister(&hdev->dev, &led_rgb->led_rgb_dev);
+
+	hid_info(hdev, "Removed Ally RGB LED interface\n");
+}
+
+/******************************************************************************/
+/* ROG Ally driver init                                                       */
+/******************************************************************************/
+
 /**
  * Initialize ROG Ally HID extension: this module works alongside
  * the main Asus HID driver to handle Ally-specific features
@@ -3689,6 +4307,14 @@ static struct ally_handheld *hid_asus_ally_probe(struct hid_device *hdev)
 			if (ret < 0)
 				return ERR_PTR(ret);
 
+			/* LED ring init - non-fatal if it fails */
+			ally_drvdata.led_rgb_dev = ally_rgb_create(hdev);
+			if (IS_ERR(ally_drvdata.led_rgb_dev)) {
+				hid_warn(hdev, "Failed to create Ally RGB LEDs\n");
+				ally_drvdata.led_rgb_dev = NULL;
+			} else {
+				hid_info(hdev, "Created Ally RGB LED controls\n");
+			}
 			break;
 		case HID_ALLY_X_INTF_IN:
 			ally_drvdata.ally_x_hdev = hdev;
@@ -3730,6 +4356,10 @@ static void hid_asus_ally_remove(struct hid_device *hdev, struct ally_handheld *
 		}
 
 		if (ally->cfg_hdev == hdev) {
+			if (ally->led_rgb_dev) {
+				ally_rgb_remove(hdev);
+				ally->led_rgb_dev = NULL;
+			}
 			ally_config_remove(hdev, ally);
 			ally->cfg_hdev = NULL;
 			ally->config = NULL;
@@ -3751,6 +4381,9 @@ static int hid_asus_ally_reset_resume(struct hid_device *hdev, struct ally_handh
 	ret = hid_asus_ally_init(hdev, ally);
 	if (ret < 0)
 		return ret;
+
+	/* Restore LED state after MCU re-initialization */
+	ally_rgb_resume();
 
 	return 0;
 }
@@ -4766,6 +5399,29 @@ asus_resume_err:
 	return ret;
 }
 
+static int __maybe_unused asus_suspend(struct hid_device *hdev, pm_message_t message)
+{
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+
+	if (drvdata->quirks & QUIRK_ROG_ALLY_XPAD) {
+		struct ally_rgb_dev *led_rgb = ally_drvdata.led_rgb_dev;
+
+		/*
+		 * Persist the current LED config so the MCU shows it at
+		 * power-on. The 0xb4 NV commit is sent here and only here:
+		 * one flash write per suspend instead of one per slider tick.
+		 */
+		if (led_rgb && led_rgb->hdev == hdev &&
+		    ally_drvdata.led_rgb_data.initialized) {
+			cancel_delayed_work_sync(&led_rgb->work);
+			if (ally_rgb_apply_effect(led_rgb) >= 0)
+				ally_rgb_commit(led_rgb);
+		}
+	}
+
+	return 0;
+}
+
 static int __maybe_unused asus_reset_resume(struct hid_device *hdev)
 {
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
@@ -5158,6 +5814,7 @@ static struct hid_driver asus_driver = {
 	.input_configured       = asus_input_configured,
 	.reset_resume           = pm_ptr(asus_reset_resume),
 	.resume			= pm_ptr(asus_resume),
+	.suspend		= pm_ptr(asus_suspend),
 	.event			= asus_event,
 	.raw_event		= asus_raw_event
 };
