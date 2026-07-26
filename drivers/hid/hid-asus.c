@@ -705,25 +705,25 @@ static const u8 ALLY_FORCE_FEEDBACK_OFF[] = {
 };
 static_assert(sizeof(struct ff_report) == sizeof(ALLY_FORCE_FEEDBACK_OFF));
 
- /*
-  * The ROG Ally device presents multiple USB interfaces (keyboard, mouse, gamepad,
-  * and custom configuration interface) that bind to the same module. Since only
-  * one ROG Ally device can be connected at a time, we use a single global static
-  * ally_handheld structure to share state across these separate HID interfaces.
-  */
+/*
+ * The ROG Ally device presents multiple USB interfaces (keyboard, mouse, gamepad,
+ * and custom configuration interface) that bind to the same module. Since only
+ * one ROG Ally device can be connected at a time, we use a single global static
+ * ally_handheld structure to share state across these separate HID interfaces.
+ */
 static void ally_resume_work_fn(struct work_struct *work);
 
- /* Changes to ally_drvdata must lock */
- static DEFINE_MUTEX(ally_data_mutex);
- static struct ally_handheld ally_drvdata = {
- 	.intf_mutex = __MUTEX_INITIALIZER(ally_drvdata.intf_mutex),
- 	/*
- 	 * Initialised statically so it is always safe to cancel, whichever
- 	 * of the interfaces probed or failed to probe.
- 	 */
- 	.resume_work = __DELAYED_WORK_INITIALIZER(ally_drvdata.resume_work,
- 						  ally_resume_work_fn, 0),
- };
+/* Changes to ally_drvdata must lock */
+static DEFINE_MUTEX(ally_data_mutex);
+static struct ally_handheld ally_drvdata = {
+	.intf_mutex = __MUTEX_INITIALIZER(ally_drvdata.intf_mutex),
+	/*
+	 * Initialised statically so it is always safe to cancel, whichever
+	 * of the interfaces probed or failed to probe.
+	 */
+	.resume_work = __DELAYED_WORK_INITIALIZER(ally_drvdata.resume_work,
+						  ally_resume_work_fn, 0),
+};
 
 static const u8 asus_report_id_init[] = {
 	FEATURE_KBD_REPORT_ID,
@@ -3195,7 +3195,7 @@ static ssize_t response_curve_pct_store(struct device *dev,
 {
 	struct ally_config *cfg = ally->config;
 	struct ally_joystick_resp_curve *curve;
-	u8 value;
+	u8 value, *curve_entry;
 	int ret;
 
 	if (!cfg->resp_curve_support)
@@ -3213,20 +3213,21 @@ static ssize_t response_curve_pct_store(struct device *dev,
 	scoped_guard(mutex, &cfg->config_mutex) {
 		switch (idx) {
 		case 1:
-			curve->entry_1.resp = value;
+			curve_entry = &curve->entry_1.resp;
 			break;
 		case 2:
-			curve->entry_2.resp = value;
+			curve_entry = &curve->entry_2.resp;
 			break;
 		case 3:
-			curve->entry_3.resp = value;
+			curve_entry = &curve->entry_3.resp;
 			break;
 		case 4:
-			curve->entry_4.resp = value;
+			curve_entry = &curve->entry_4.resp;
 			break;
-		default:
-			return -EINVAL;
+		default: return -EINVAL;
 		}
+
+		*curve_entry = value;
 	}
 
 	return count;
@@ -3240,7 +3241,7 @@ static ssize_t response_curve_move_store(struct device *dev,
 {
 	struct ally_config *cfg = ally->config;
 	struct ally_joystick_resp_curve *curve;
-	u8 value;
+	u8 value, *curve_entry;
 	int ret;
 
 	if (!cfg->resp_curve_support)
@@ -3258,20 +3259,21 @@ static ssize_t response_curve_move_store(struct device *dev,
 	scoped_guard(mutex, &cfg->config_mutex) {
 		switch (idx) {
 		case 1:
-			curve->entry_1.move = value;
+			curve_entry = &curve->entry_1.move;
 			break;
 		case 2:
-			curve->entry_2.move = value;
+			curve_entry = &curve->entry_2.move;
 			break;
 		case 3:
-			curve->entry_3.move = value;
+			curve_entry = &curve->entry_3.move;
 			break;
 		case 4:
-			curve->entry_4.move = value;
+			curve_entry = &curve->entry_4.move;
 			break;
-		default:
-			return -EINVAL;
+		default: return -EINVAL;
 		}
+
+		*curve_entry = value;
 	}
 
 	return count;
@@ -4661,7 +4663,7 @@ struct ally_x_input_report {
 	uint16_t x, y;
 	uint16_t rx, ry;
 	uint16_t z, rz;
-	uint8_t buttons[4];
+	uint8_t buttons[3];
 } __packed;
 
 /* The hatswitch outputs integers, we use them to index this X|Y pair */
@@ -4957,6 +4959,12 @@ static struct ally_handheld *hid_asus_ally_probe(struct hid_device *hdev)
 
 			ret = hid_asus_ally_init(hdev, &ally_drvdata);
 			if (ret < 0) {
+				/*
+				 * asus_probe() only logs this failure, so nothing
+				 * else will clear the globals: release the sysfs
+				 * attributes and drop the stale device pointers
+				 * here or they outlive the hid_device.
+				 */
 				ally_config_remove(hdev, &ally_drvdata);
 				ally_drvdata.config = NULL;
 				ally_drvdata.cfg_hdev = NULL;
