@@ -712,6 +712,7 @@ static_assert(sizeof(struct ff_report) == sizeof(ALLY_FORCE_FEEDBACK_OFF));
   * ally_handheld structure to share state across these separate HID interfaces.
   */
 static void ally_resume_work_fn(struct work_struct *work);
+static int ally_gamepad_check_ready(struct ally_handheld *ally, struct hid_device *hdev);
 
  /* Changes to ally_drvdata must lock */
  static DEFINE_MUTEX(ally_data_mutex);
@@ -4511,6 +4512,22 @@ static struct ally_config *ally_config_create(struct hid_device *hdev, struct al
 	cfg = devm_kzalloc(&hdev->dev, sizeof(*cfg), GFP_KERNEL);
 	if (!cfg)
 		return ERR_PTR(-ENOMEM);
+
+	/*
+	 * The capability queries below are single-shot with no retry, and a
+	 * failed or garbled reply reads back as "unsupported". On cold boot
+	 * the MCU may not have finished starting up when this interface
+	 * probes, in which case every support flag ends up false: the turbo
+	 * button attributes are never created and, worse, the
+	 * xbox_controller_support gate below never enables controller
+	 * reporting, leaving the gamepad endpoint silent. Wait for the MCU
+	 * first, as the ally_gamepad_check_ready() contract requires.
+	 */
+	ret = ally_gamepad_check_ready(ally, hdev);
+	if (ret < 0) {
+		hid_err(hdev, "MCU not ready for capability detection: %d\n", ret);
+		goto ally_config_create_err;
+	}
 
 	ret = ally_detect_capabilities(hdev, ally, cfg);
 	if (ret < 0) {
