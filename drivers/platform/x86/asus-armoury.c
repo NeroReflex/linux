@@ -778,6 +778,28 @@ ASUS_ATTR_GROUP_ROG_TUNABLE(nv_tgp, "nv_tgp", ASUS_WMI_DEVID_DGPU_SET_TGP,
 ASUS_ATTR_GROUP_INT_VALUE_ONLY_RO(nv_base_tgp, ATTR_NV_BASE_TGP, ASUS_WMI_DEVID_DGPU_BASE_TGP,
 				  "Read the base TGP value");
 
+/* Input & Switch attributes */
+ASUS_ATTR_GROUP_BOOL_RW(ess_switch, "ess_switch", ASUS_WMI_DEVID_ESS_SWITCH,
+			"Toggle the ESS DAC");
+ASUS_ATTR_GROUP_BOOL_RW(touchscreen_toggle, "touchscreen_toggle",
+			ASUS_WMI_DEVID_TOUCHSCREEN,
+			"Toggle the touchscreen");
+ASUS_ATTR_GROUP_BOOL_RW(winkey_disable, "winkey_disable",
+			ASUS_WMI_DEVID_WINKEY_DISABLE,
+			"Toggle the Windows key lock");
+
+/* GPU read-only attributes */
+ASUS_ATTR_GROUP_BOOL_RO(egpu_dock_state, "egpu_dock_state",
+			ASUS_WMI_DEVID_EGPU_DOCK_STATE,
+			"Show external GPU dock connection");
+ASUS_ATTR_GROUP_BOOL_RO(edp_mode, "edp_mode", ASUS_WMI_DEVID_EDP_MODE,
+			"Show the eDP panel mode");
+
+/* Product type read-only */
+ASUS_ATTR_GROUP_INT_VALUE_ONLY_RO(product_type, "product_type",
+				  ASUS_WMI_DEVID_PRODUCT_TYPE,
+				  "Show ASUS firmware product type");
+
 /* If an attribute does not require any special case handling add it here */
 static const struct asus_attr_group armoury_attr_groups[] = {
 	{ &egpu_connected_attr_group, ASUS_WMI_DEVID_EGPU_CONNECTED },
@@ -801,6 +823,12 @@ static const struct asus_attr_group armoury_attr_groups[] = {
 	{ &panel_od_attr_group, ASUS_WMI_DEVID_PANEL_OD },
 	{ &panel_hd_mode_attr_group, ASUS_WMI_DEVID_PANEL_HD },
 	{ &screen_auto_brightness_attr_group, ASUS_WMI_DEVID_SCREEN_AUTO_BRIGHTNESS },
+	{ &ess_switch_attr_group, ASUS_WMI_DEVID_ESS_SWITCH },
+	{ &touchscreen_toggle_attr_group, ASUS_WMI_DEVID_TOUCHSCREEN },
+	{ &winkey_disable_attr_group, ASUS_WMI_DEVID_WINKEY_DISABLE },
+	{ &egpu_dock_state_attr_group, ASUS_WMI_DEVID_EGPU_DOCK_STATE },
+	{ &edp_mode_attr_group, ASUS_WMI_DEVID_EDP_MODE },
+	{ &product_type_attr_group, ASUS_WMI_DEVID_PRODUCT_TYPE },
 };
 
 /**
