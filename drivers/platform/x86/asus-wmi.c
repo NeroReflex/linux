@@ -40,6 +40,7 @@
 #include <linux/spinlock.h>
 #include <linux/types.h>
 #include <linux/units.h>
+#include <linux/unaligned.h>
 
 #include <acpi/battery.h>
 #include <acpi/video.h>
@@ -239,10 +240,20 @@ struct fan_curve_data {
 	u8 percents[FAN_CURVE_POINTS];
 };
 
+struct asus_oem_identity {
+	u8 product_line;
+	u8 product_sku;
+	u16 year;
+	u32 features_raw;
+	bool valid;
+};
+
 struct asus_wmi {
 	int dsts_id;
 	int spec;
 	int sfun;
+
+	struct asus_oem_identity oem_id;
 
 	struct input_dev *inputdev;
 	struct backlight_device *backlight_device;
@@ -4690,6 +4701,161 @@ static ssize_t cpufv_store(struct device *dev, struct device_attribute *attr,
 
 static DEVICE_ATTR_WO(cpufv);
 
+/* SMBIOS Type 40 OEM Identity Parsing */
+
+static const char *dmi_string_by_index(const struct dmi_header *dm, u8 index)
+{
+	const char *bp;
+
+	if (index == 0)
+		return NULL;
+
+	bp = (const char *)dm + dm->length;
+
+	while (index > 1 && *bp) {
+		bp += strlen(bp) + 1;
+		index--;
+	}
+
+	if (!*bp)
+		return NULL;
+
+	return bp;
+}
+
+static void asus_wmi_parse_type40_struct(const struct dmi_header *dm, void *private_data)
+{
+	struct asus_oem_identity *oem = private_data;
+	const u8 *data = (const u8 *)dm;
+	u8 count, offset, i;
+
+	if (dm->type != 40 || dm->length < 5)
+		return;
+
+	count = data[4];
+	offset = 5;
+
+	for (i = 0; i < count; i++) {
+		u8 entry_length, name_idx;
+		const char *name;
+		const u8 *val;
+
+		if (offset + 5 > dm->length)
+			break;
+
+		entry_length = data[offset];
+		if (entry_length < 5 || offset + entry_length > dm->length)
+			break;
+
+		name_idx = data[offset + 4];
+		name = dmi_string_by_index(dm, name_idx);
+		val = &data[offset + 5];
+
+		if (name) {
+			if (!strcmp(name, "PRODUCT_LINE") && entry_length >= 6) {
+				oem->product_line = val[0];
+				oem->valid = true;
+			} else if (!strcmp(name, "PRODUCT_SKU") && entry_length >= 6) {
+				oem->product_sku = val[0];
+				oem->valid = true;
+			} else if (!strcmp(name, "YEAR") && entry_length >= 7) {
+				oem->year = get_unaligned_le16(val);
+				oem->valid = true;
+			} else if (!strcmp(name, "FEATURES") && entry_length >= 9) {
+				oem->features_raw = get_unaligned_le32(val);
+				oem->valid = true;
+			}
+		}
+
+		offset += entry_length;
+	}
+}
+
+static void asus_wmi_fetch_oem_identity(struct asus_wmi *asus)
+{
+	dmi_walk(asus_wmi_parse_type40_struct, &asus->oem_id);
+}
+
+static const char *asus_wmi_get_subbrand(u8 sku)
+{
+	switch (sku) {
+	case 0:
+	case 5:
+	case 6:
+		return "ASUS";
+	case 1:
+	case 4:
+		return "ROG";
+	case 2:
+	case 3:
+		return "TUF";
+	case 7:
+		return "ProArt";
+	default:
+		return "Unknown";
+	}
+}
+
+static ssize_t oem_product_line_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct asus_wmi *asus = dev_get_drvdata(dev);
+	static const char * const names[] = {
+		"Motherboard", "Server", "WS", "AIO", "Desktop", "Notebook", "Mini PC"
+	};
+
+	if (!asus->oem_id.valid)
+		return -ENODATA;
+
+	if (asus->oem_id.product_line < ARRAY_SIZE(names))
+		return sysfs_emit(buf, "%s\n", names[asus->oem_id.product_line]);
+
+	return sysfs_emit(buf, "Unknown (%u)\n", asus->oem_id.product_line);
+}
+static DEVICE_ATTR_RO(oem_product_line);
+
+static ssize_t oem_product_sku_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	struct asus_wmi *asus = dev_get_drvdata(dev);
+	static const char * const names[] = {
+		"PRIME", "ROG", "TUF", "TUF-Gaming", "ROG-Strix", "XU", "Pro", "ProArt"
+	};
+
+	if (!asus->oem_id.valid)
+		return -ENODATA;
+
+	if (asus->oem_id.product_sku < ARRAY_SIZE(names))
+		return sysfs_emit(buf, "%s\n", names[asus->oem_id.product_sku]);
+
+	return sysfs_emit(buf, "Unknown (%u)\n", asus->oem_id.product_sku);
+}
+static DEVICE_ATTR_RO(oem_product_sku);
+
+static ssize_t oem_subbrand_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct asus_wmi *asus = dev_get_drvdata(dev);
+
+	if (!asus->oem_id.valid)
+		return -ENODATA;
+
+	return sysfs_emit(buf, "%s\n", asus_wmi_get_subbrand(asus->oem_id.product_sku));
+}
+static DEVICE_ATTR_RO(oem_subbrand);
+
+static ssize_t oem_year_show(struct device *dev,
+			     struct device_attribute *attr, char *buf)
+{
+	struct asus_wmi *asus = dev_get_drvdata(dev);
+
+	if (!asus->oem_id.valid)
+		return -ENODATA;
+
+	return sysfs_emit(buf, "%u\n", asus->oem_id.year);
+}
+static DEVICE_ATTR_RO(oem_year);
+
 static struct attribute *platform_attributes[] = {
 	&dev_attr_cpufv.attr,
 	&dev_attr_camera.attr,
@@ -4698,6 +4864,10 @@ static struct attribute *platform_attributes[] = {
 	&dev_attr_lid_resume.attr,
 	&dev_attr_als_enable.attr,
 	&dev_attr_fan_boost_mode.attr,
+	&dev_attr_oem_product_line.attr,
+	&dev_attr_oem_product_sku.attr,
+	&dev_attr_oem_subbrand.attr,
+	&dev_attr_oem_year.attr,
 #if IS_ENABLED(CONFIG_ASUS_WMI_DEPRECATED_ATTRS)
 		&dev_attr_charge_mode.attr,
 		&dev_attr_egpu_enable.attr,
@@ -4729,7 +4899,12 @@ static umode_t asus_sysfs_is_visible(struct kobject *kobj,
 	bool ok = true;
 	int devid = -1;
 
-	if (attr == &dev_attr_camera.attr)
+	if (attr == &dev_attr_oem_product_line.attr ||
+	    attr == &dev_attr_oem_product_sku.attr ||
+	    attr == &dev_attr_oem_subbrand.attr ||
+	    attr == &dev_attr_oem_year.attr)
+		ok = asus->oem_id.valid;
+	else if (attr == &dev_attr_camera.attr)
 		devid = ASUS_WMI_DEVID_CAMERA;
 	else if (attr == &dev_attr_cardr.attr)
 		devid = ASUS_WMI_DEVID_CARDREADER;
@@ -5080,6 +5255,8 @@ static int asus_wmi_add(struct platform_device *pdev)
 	err = platform_profile_setup(asus);
 	if (err)
 		goto fail_platform_profile_setup;
+
+	asus_wmi_fetch_oem_identity(asus);
 
 	err = asus_wmi_sysfs_init(asus->platform_device);
 	if (err)
