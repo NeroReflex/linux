@@ -794,6 +794,12 @@ ASUS_ATTR_GROUP_BOOL_RO(egpu_dock_state, "egpu_dock_state",
 			"Show external GPU dock connection");
 ASUS_ATTR_GROUP_BOOL_RO(edp_mode, "edp_mode", ASUS_WMI_DEVID_EDP_MODE,
 			"Show the eDP panel mode");
+ASUS_ATTR_GROUP_BOOL_RO(gpu_dyn_boost_status, "gpu_dyn_boost_status",
+			ASUS_WMI_DEVID_GPU_DYN_BOOST_STATUS,
+			"Show GPU Dynamic Boost support status");
+ASUS_ATTR_GROUP_INT_VALUE_ONLY_RO(gpu_dyn_boost_value, "gpu_dyn_boost_value",
+				  ASUS_WMI_DEVID_GPU_DYN_BOOST_VALUE,
+				  "Read GPU Dynamic Boost allocation value");
 
 /* Product type read-only */
 ASUS_ATTR_GROUP_INT_VALUE_ONLY_RO(product_type, "product_type",
@@ -829,6 +835,8 @@ static const struct asus_attr_group armoury_attr_groups[] = {
 	{ &egpu_dock_state_attr_group, ASUS_WMI_DEVID_EGPU_DOCK_STATE },
 	{ &edp_mode_attr_group, ASUS_WMI_DEVID_EDP_MODE },
 	{ &product_type_attr_group, ASUS_WMI_DEVID_PRODUCT_TYPE },
+	{ &gpu_dyn_boost_status_attr_group, ASUS_WMI_DEVID_GPU_DYN_BOOST_STATUS },
+	{ &gpu_dyn_boost_value_attr_group, ASUS_WMI_DEVID_GPU_DYN_BOOST_VALUE },
 };
 
 /**
