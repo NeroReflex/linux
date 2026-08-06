@@ -350,8 +350,8 @@ enum ally_button_id {
 	ALLY_BTN_J1B,
 	ALLY_BTN_MENU,
 	ALLY_BTN_VIEW,
-	ALLY_BTN_M1,
-	ALLY_BTN_M2,
+	ALLY_BTN_M1,	/* right rear paddle */
+	ALLY_BTN_M2,	/* left rear paddle */
 	ALLY_BTN_MAX
 };
 
@@ -407,6 +407,7 @@ struct ally_turbo_config {
 	struct ally_btn_turbo_params btn_y;
 	struct ally_btn_turbo_params btn_view;
 	struct ally_btn_turbo_params btn_menu;
+	/* The firmware turbo payload orders M2 before M1 */
 	struct ally_btn_turbo_params btn_m2;
 	struct ally_btn_turbo_params btn_m1;
 };
@@ -771,16 +772,14 @@ static void ally_resume_work_fn(struct work_struct *work)
 	 * (workaround for Ally X USB re-probing during suspend/resume)
 	 */
 	if (keyboard_input) {
-		input_report_key(keyboard_input, KEY_F16, 0);
-		input_report_key(keyboard_input, KEY_F17, 0);
 		input_report_key(keyboard_input, KEY_PROG1, 0);
+		input_report_key(keyboard_input, KEY_PROG2, 0);
 		input_sync(keyboard_input);
 	}
 
 	if (x_input) {
-		input_report_key(x_input, KEY_F16, 0);
-		input_report_key(x_input, KEY_F17, 0);
 		input_report_key(x_input, KEY_PROG1, 0);
+		input_report_key(x_input, KEY_PROG2, 0);
 		input_sync(x_input);
 	}
 }
@@ -1903,10 +1902,10 @@ static bool handle_ally_event(struct hid_device *hdev, struct ally_handheld *all
 			keycode = KEY_PROG1;
 			break;
 		case 0xA6:
-			keycode = KEY_F16;
+			keycode = KEY_PROG1;
 			break;
 		case 0xA7:
-			keycode = KEY_F17;
+			keycode = KEY_PROG1;
 			break;
 		default:
 			return false;
@@ -3786,8 +3785,8 @@ static const struct btn_code_map ally_btn_codes[] = {
 	{ BTN_TYPE_PAD, 0x13, "PAD_XBOX" },
 
 	/* Keyboard button codes */
-	{ BTN_TYPE_KB, 0x8E, "KB_M2" },
-	{ BTN_TYPE_KB, 0x8F, "KB_M1" },
+	{ BTN_TYPE_KB, 0x8E, "KB_M2" },	/* left rear paddle */
+	{ BTN_TYPE_KB, 0x8F, "KB_M1" },	/* right rear paddle */
 	{ BTN_TYPE_KB, 0x76, "KB_ESC" },
 	{ BTN_TYPE_KB, 0x50, "KB_F1" },
 	{ BTN_TYPE_KB, 0x60, "KB_F2" },
@@ -4904,8 +4903,7 @@ static int ally_x_setup_input(struct hid_device *hdev, struct ally_handheld *all
 	input_set_capability(input, EV_KEY, BTN_THUMBR);
 
 	input_set_capability(input, EV_KEY, KEY_PROG1);
-	input_set_capability(input, EV_KEY, KEY_F16);
-	input_set_capability(input, EV_KEY, KEY_F17);
+	input_set_capability(input, EV_KEY, KEY_PROG2);
 	input_set_capability(input, EV_KEY, BTN_TRIGGER_HAPPY);
 	input_set_capability(input, EV_KEY, BTN_TRIGGER_HAPPY1);
 
@@ -5977,19 +5975,22 @@ static int asus_input_mapping(struct hid_device *hdev,
 		return -1;
 
 	/* The Xbox Ally X sends its front-button long-press events as plain
-	 * keyboard usages F21/F22 instead of the original Ally's vendor codes
-	 * (0xA7/0x38). Remap them to the same F17/PROG1 those codes produce so
-	 * userspace sees consistent events across Ally generations.
+	 * keyboard usages F21/F22 instead of vendor codes (the original Ally
+	 * only has 0xA7 for the ROG button long-press). Remap them to the same
+	 * PROG1/PROG2 the short presses produce so each physical button emits
+	 * a single keycode regardless of press duration (button placement
+	 * differs between Ally generations, so buttons are identified by
+	 * name only): AC = PROG1, CC = PROG2.
 	 */
 	if ((drvdata->quirks & QUIRK_ROG_ALLY_XPAD) &&
 	    (usage->hid & HID_USAGE_PAGE) == HID_UP_KEYBOARD) {
 		switch (usage->hid & HID_USAGE) {
-		case 0x70: /* F21: left AC button long-press */
-			asus_map_key_clear(KEY_F17);
+		case 0x70: /* F21: AC button long-press */
+			asus_map_key_clear(KEY_PROG1);
 			set_bit(EV_REP, hi->input->evbit);
 			return 1;
-		case 0x71: /* F22: right AC button long-press */
-			asus_map_key_clear(KEY_PROG1);
+		case 0x71: /* F22: CC button long-press */
+			asus_map_key_clear(KEY_PROG2);
 			set_bit(EV_REP, hi->input->evbit);
 			return 1;
 		}
@@ -6015,7 +6016,7 @@ static int asus_input_mapping(struct hid_device *hdev,
 		case 0x8b: asus_map_key_clear(KEY_PROG1);	break; /* ProArt Creator Hub key */
 		case 0x6b: asus_map_key_clear(KEY_F21);		break; /* ASUS touchpad toggle */
 		case 0x38: asus_map_key_clear(KEY_PROG1);	break; /* ROG key */
-		case 0x93: asus_map_key_clear(KEY_PROG1);	break; /* ROG Ally X right AC button */
+		case 0x93: asus_map_key_clear(KEY_PROG2);	break; /* Ally X CC button */
 		case 0xba: asus_map_key_clear(KEY_PROG2);	break; /* Fn+C ASUS Splendid */
 		case 0x5c: asus_map_key_clear(KEY_PROG3);	break; /* Fn+Space Power4Gear */
 		case 0x99: asus_map_key_clear(KEY_PROG4);	break; /* Fn+F5 "fan" symbol */
@@ -6025,9 +6026,9 @@ static int asus_input_mapping(struct hid_device *hdev,
 		case 0xb3: asus_map_key_clear(KEY_PROG3);	break; /* Fn+Left next aura */
 		case 0x6a: asus_map_key_clear(KEY_F13);		break; /* Screenpad toggle */
 		case 0x4b: asus_map_key_clear(KEY_F14);		break; /* Arrows/Pg-Up/Dn toggle */
-		case 0xa5: asus_map_key_clear(KEY_F15);		break; /* ROG Ally left back */
-		case 0xa6: asus_map_key_clear(KEY_F16);		break; /* ROG Ally QAM button */
-		case 0xa7: asus_map_key_clear(KEY_F17);		break; /* ROG Ally ROG long-press */
+		case 0xa5: asus_map_key_clear(KEY_F15);		break; /* ROG Ally M2 (left rear) */
+		case 0xa6: asus_map_key_clear(KEY_PROG2);	break; /* ROG Ally CC/QAM button */
+		case 0xa7: asus_map_key_clear(KEY_PROG1);	break; /* ROG Ally ROG/AC long-press */
 
 		default:
 			/* ASUS lazily declares 256 usages, ignore the rest,
