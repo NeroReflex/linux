@@ -530,6 +530,7 @@ struct asus_drvdata {
 	unsigned long battery_next_query;
 	struct work_struct fn_lock_sync_work;
 	bool fn_lock;
+	u8 ally_frontbtn_down;
 };
 
 static int asus_report_battery(struct asus_drvdata *, u8 *, int);
@@ -5328,6 +5329,62 @@ static int asus_raw_event(struct hid_device *hdev,
 			data[1] = 0x00;
 
 		/*
+		 * Front-button long-press: once a press outlives the MCU's
+		 * long-press threshold (~200ms, measured on the Xbox Ally X,
+		 * FW FGA80100.RC73XA.325), the keyboard interface holds kbd
+		 * usage 0x70 (AC button) / 0x71 (CC button) down until the
+		 * button is released. Userspace wants exactly one PROG event
+		 * per press, delivered on release, with no autorepeat (the
+		 * generic path would autorepeat: hid-input enables EV_REP on
+		 * keyboard nodes). Strip the usages from the report before
+		 * the generic parser sees them, track the held state here,
+		 * and synthesize the complete press+release pair (with the
+		 * matching MSC_SCAN) on the break. Report layout: data[1] =
+		 * modifiers, data[2] reserved, data[3..8] = 6-slot key
+		 * array, data[9..] = NKRO bitmap, one bit per usage.
+		 */
+		if (report->id == 0x01 &&
+		    report->application == HID_GD_KEYBOARD &&
+		    size >= 9 && drvdata->input) {
+			int i, u;
+
+			for (u = 0x70; u <= 0x71; u++) {
+				int byte = 9 + (u >> 3);
+				u8 bit = BIT(u & 7);
+				u8 held = BIT(u - 0x70);
+				bool down = false;
+
+				for (i = 3; i <= 8; i++) {
+					if (data[i] == u) {
+						data[i] = 0;
+						down = true;
+					}
+				}
+				if (size > byte && (data[byte] & bit)) {
+					data[byte] &= ~bit;
+					down = true;
+				}
+
+				if (down) {
+					drvdata->ally_frontbtn_down |= held;
+				} else if (drvdata->ally_frontbtn_down & held) {
+					int code = u == 0x70 ? KEY_PROG1
+							     : KEY_PROG2;
+
+					drvdata->ally_frontbtn_down &= ~held;
+					input_event(drvdata->input, EV_MSC,
+						    MSC_SCAN, HID_UP_KEYBOARD | u);
+					input_report_key(drvdata->input, code, 1);
+					input_sync(drvdata->input);
+					input_event(drvdata->input, EV_MSC,
+						    MSC_SCAN, HID_UP_KEYBOARD | u);
+					input_report_key(drvdata->input, code, 0);
+					input_sync(drvdata->input);
+				}
+			}
+		}
+
+		/*
 		 * Return -1 to suppress further processing by the generic HID
 		 * input parser for reports we fully handle for the Gamepad (0x0B).
 		 * If we let 0x0B fall through then the default parser creates a
@@ -5981,17 +6038,25 @@ static int asus_input_mapping(struct hid_device *hdev,
 	 * a single keycode regardless of press duration (button placement
 	 * differs between Ally generations, so buttons are identified by
 	 * name only): AC = PROG1, CC = PROG2.
+	 *
+	 * These usages behave like a held key: the MCU reports the make once
+	 * the press outlives the ~200ms long-press threshold and the break
+	 * when the button is let go. The generic parser never sees them -
+	 * asus_raw_event() strips them from the keyboard report and emits the
+	 * whole press+release pair on the break, so a long press delivers
+	 * exactly one PROG event on button release, without autorepeat - the
+	 * same shape the short press has via handle_ally_event(). The
+	 * mappings below still matter: they register the PROG capabilities on
+	 * the input node the synthesized events are delivered through.
 	 */
 	if ((drvdata->quirks & QUIRK_ROG_ALLY_XPAD) &&
 	    (usage->hid & HID_USAGE_PAGE) == HID_UP_KEYBOARD) {
 		switch (usage->hid & HID_USAGE) {
 		case 0x70: /* F21: AC button long-press */
 			asus_map_key_clear(KEY_PROG1);
-			set_bit(EV_REP, hi->input->evbit);
 			return 1;
 		case 0x71: /* F22: CC button long-press */
 			asus_map_key_clear(KEY_PROG2);
-			set_bit(EV_REP, hi->input->evbit);
 			return 1;
 		}
 	}
@@ -6155,6 +6220,10 @@ static int __maybe_unused asus_resume(struct hid_device *hdev)
 	}
 
 	if (ally && (drvdata->quirks & QUIRK_ROG_ALLY_XPAD)) {
+		/* a front-button break lost across suspend must not turn the
+		 * next keyboard report into a phantom PROG pair */
+		drvdata->ally_frontbtn_down = 0;
+
 		ep = ally_get_endpoint_address(hdev);
 		if (ep == HID_ALLY_INTF_CFG_IN)
 			schedule_delayed_work(&ally->resume_work, msecs_to_jiffies(500));
@@ -6206,6 +6275,7 @@ static int __maybe_unused asus_reset_resume(struct hid_device *hdev)
 		return asus_start_multitouch(hdev);
 
 	if (drvdata->quirks & QUIRK_ROG_ALLY_XPAD) {
+		drvdata->ally_frontbtn_down = 0;
 		ret = hid_asus_ally_reset_resume(hdev, drvdata->rog_ally);
 		if (ret) {
 			hid_err(hdev, "Failed to resume ROG Ally HID extensions: %d\n", ret);
