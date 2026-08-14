@@ -651,7 +651,7 @@ enum ally_command_codes {
 };
 
 static const char *const asus_usb_rgb_effect_strings[ASUS_USB_RGB_EFFECT_MAX] = {
-	[ASUS_USB_RGB_EFFECT_STATIC] = "monochrome",
+	[ASUS_USB_RGB_EFFECT_STATIC] = "monocolor",
 	[ASUS_USB_RGB_EFFECT_BREATHING] = "breathe",
 	[ASUS_USB_RGB_EFFECT_COLOR_CYCLE] = "chroma",
 	[ASUS_USB_RGB_EFFECT_RAINBOW] = "rainbow",
@@ -4865,9 +4865,15 @@ static void asus_usb_rgb_zone_state_default(struct asus_usb_rgb_zone_state *stat
 		state->bg_blue = 0x00;
 		break;
 	case ASUS_AURA_ZONE_JOYSTICK_RING:
-		state->red = 0xff;
-		state->green = 0xff;
-		state->blue = 0xff;
+		/*
+		 * Leave the rings dark until userspace asks for a color: the
+		 * state is pushed to the device once the zone is registered, so
+		 * a lit default lights them on every cold boot until the
+		 * desktop restores its own settings.
+		 */
+		state->red = 0x00;
+		state->green = 0x00;
+		state->blue = 0x00;
 		break;
 	default:
 		state->red = 0x00;
@@ -5695,7 +5701,12 @@ static int asus_usb_rgb_register_zone(struct asus_usb_rgb_dev *rgb, int idx)
 	cdev->brightness = state->brightness;
 	cdev->max_brightness = 100;
 	cdev->brightness_set = asus_usb_rgb_set;
-	cdev->color = LED_COLOR_ID_MULTI;
+	/*
+	 * The rings reproduce arbitrary colors, which LED_COLOR_ID_RGB
+	 * describes; LED_COLOR_ID_MULTI is the generic multicolor case and
+	 * leaves userspace unable to tell the two apart.
+	 */
+	cdev->color = LED_COLOR_ID_RGB;
 
 	zone->subled_info[0].intensity = state->red;
 	zone->subled_info[1].intensity = state->green;
