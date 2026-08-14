@@ -512,6 +512,11 @@ struct asus_usb_rgb_hw_desc {
 	u8 apply_cmd;
 	/* Fallback effect mask for firmware that answers no capability query */
 	u16 supported_effects;
+	/*
+	 * Colors exposed through multi_intensity: 3 for a single color set,
+	 * 6 to also expose the background color used by two-color effects.
+	 */
+	u8 color_components;
 };
 
 struct asus_usb_rgb_dev;
@@ -696,6 +701,7 @@ static const struct asus_usb_rgb_hw_desc asus_usb_rgb_hw_ally = {
 	.config_cmd = ASUS_USB_RGB_CMD_CONFIG,
 	.set_cmd = ASUS_USB_RGB_CMD_SET,
 	.apply_cmd = ASUS_USB_RGB_CMD_APPLY,
+	.color_components = 3,
 	.supported_effects = BIT(ASUS_USB_RGB_EFFECT_STATIC) |
 			     BIT(ASUS_USB_RGB_EFFECT_BREATHING) |
 			     BIT(ASUS_USB_RGB_EFFECT_COLOR_CYCLE) |
@@ -5121,9 +5127,15 @@ static int asus_usb_rgb_send_zone_effect(struct asus_usb_rgb_zone *zone)
 	report.red = state->enabled ? zone->mc_cdev.subled_info[0].brightness : 0;
 	report.green = state->enabled ? zone->mc_cdev.subled_info[1].brightness : 0;
 	report.blue = state->enabled ? zone->mc_cdev.subled_info[2].brightness : 0;
-	report.bg_red = state->enabled ? zone->mc_cdev.subled_info[3].brightness : 0;
-	report.bg_green = state->enabled ? zone->mc_cdev.subled_info[4].brightness : 0;
-	report.bg_blue = state->enabled ? zone->mc_cdev.subled_info[5].brightness : 0;
+	if (zone->mc_cdev.num_colors == 6) {
+		report.bg_red = state->enabled ? zone->mc_cdev.subled_info[3].brightness : 0;
+		report.bg_green = state->enabled ? zone->mc_cdev.subled_info[4].brightness : 0;
+		report.bg_blue = state->enabled ? zone->mc_cdev.subled_info[5].brightness : 0;
+	} else {
+		report.bg_red = state->enabled ? state->bg_red : 0;
+		report.bg_green = state->enabled ? state->bg_green : 0;
+		report.bg_blue = state->enabled ? state->bg_blue : 0;
+	}
 	report.speed = asus_usb_rgb_speed_to_hw(state->speed);
 	report.direction = state->direction;
 
@@ -5277,17 +5289,22 @@ static void asus_usb_rgb_set(struct led_classdev *cdev, enum led_brightness brig
 
 	changed = state->red != mc_cdev->subled_info[0].intensity ||
 		state->green != mc_cdev->subled_info[1].intensity ||
-		state->blue != mc_cdev->subled_info[2].intensity ||
-		state->bg_red != mc_cdev->subled_info[3].intensity ||
-		state->bg_green != mc_cdev->subled_info[4].intensity ||
-		state->bg_blue != mc_cdev->subled_info[5].intensity;
+		state->blue != mc_cdev->subled_info[2].intensity;
 
 	state->red = mc_cdev->subled_info[0].intensity;
 	state->green = mc_cdev->subled_info[1].intensity;
 	state->blue = mc_cdev->subled_info[2].intensity;
-	state->bg_red = mc_cdev->subled_info[3].intensity;
-	state->bg_green = mc_cdev->subled_info[4].intensity;
-	state->bg_blue = mc_cdev->subled_info[5].intensity;
+
+	if (mc_cdev->num_colors == 6) {
+		changed = changed ||
+			state->bg_red != mc_cdev->subled_info[3].intensity ||
+			state->bg_green != mc_cdev->subled_info[4].intensity ||
+			state->bg_blue != mc_cdev->subled_info[5].intensity;
+
+		state->bg_red = mc_cdev->subled_info[3].intensity;
+		state->bg_green = mc_cdev->subled_info[4].intensity;
+		state->bg_blue = mc_cdev->subled_info[5].intensity;
+	}
 	state->brightness = brightness;
 	state->initialized = true;
 
@@ -5638,10 +5655,18 @@ static const struct attribute_group asus_usb_rgb_zone_attr_group = {
 
 static int asus_usb_rgb_register_zone(struct asus_usb_rgb_dev *rgb, int idx)
 {
+	static const u32 rgb_color_index[3] = {
+		LED_COLOR_ID_RED, LED_COLOR_ID_GREEN, LED_COLOR_ID_BLUE,
+	};
 	struct asus_usb_rgb_zone *zone = &rgb->zones[idx];
 	struct asus_usb_rgb_zone_state *state;
 	struct led_classdev *cdev;
-	int ret;
+	u8 components;
+	int ret, i;
+
+	components = rgb->desc->color_components;
+	if (components != 3 && components != 6)
+		return -EINVAL;
 
 	zone->parent = rgb;
 	zone->zone_id = rgb->desc->zones[idx];
@@ -5650,15 +5675,11 @@ static int asus_usb_rgb_register_zone(struct asus_usb_rgb_dev *rgb, int idx)
 	if (!state)
 		return -EINVAL;
 
-	zone->subled_info[0].color_index = LED_COLOR_ID_RED;
-	zone->subled_info[1].color_index = LED_COLOR_ID_GREEN;
-	zone->subled_info[2].color_index = LED_COLOR_ID_BLUE;
-	zone->subled_info[3].color_index = LED_COLOR_ID_RED;
-	zone->subled_info[4].color_index = LED_COLOR_ID_GREEN;
-	zone->subled_info[5].color_index = LED_COLOR_ID_BLUE;
+	for (i = 0; i < components; i++)
+		zone->subled_info[i].color_index = rgb_color_index[i % 3];
 
 	zone->mc_cdev.subled_info = zone->subled_info;
-	zone->mc_cdev.num_colors = ARRAY_SIZE(zone->subled_info);
+	zone->mc_cdev.num_colors = components;
 
 	cdev = &zone->mc_cdev.led_cdev;
 	cdev->name = devm_kasprintf(&rgb->hdev->dev, GFP_KERNEL,
@@ -5679,9 +5700,11 @@ static int asus_usb_rgb_register_zone(struct asus_usb_rgb_dev *rgb, int idx)
 	zone->subled_info[0].intensity = state->red;
 	zone->subled_info[1].intensity = state->green;
 	zone->subled_info[2].intensity = state->blue;
-	zone->subled_info[3].intensity = state->bg_red;
-	zone->subled_info[4].intensity = state->bg_green;
-	zone->subled_info[5].intensity = state->bg_blue;
+	if (components == 6) {
+		zone->subled_info[3].intensity = state->bg_red;
+		zone->subled_info[4].intensity = state->bg_green;
+		zone->subled_info[5].intensity = state->bg_blue;
+	}
 	led_mc_calc_color_components(&zone->mc_cdev, cdev->brightness);
 
 	spin_lock_init(&zone->lock);
