@@ -3847,6 +3847,8 @@ struct ally_x_input_report {
 	uint16_t z, rz;
 	uint8_t buttons[3];
 } __packed;
+static_assert(sizeof(struct ally_x_input_report) ==
+	      HID_ALLY_X_INPUT_REPORT_SIZE - 1);
 
 /* The hatswitch outputs integers, we use them to index this X|Y pair */
 static const int hat_values[][2] = {
