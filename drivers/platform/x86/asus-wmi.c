@@ -16,6 +16,7 @@
 #include <linux/acpi.h>
 #include <linux/backlight.h>
 #include <linux/bits.h>
+#include <linux/cleanup.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/dmi.h>
@@ -28,6 +29,7 @@
 #include <linux/leds.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/pci.h>
 #include <linux/pci_hotplug.h>
 #include <linux/platform_data/x86/asus-wmi.h>
@@ -350,32 +352,54 @@ static void asus_wmi_show_deprecated(void)
 
 /* WMI ************************************************************************/
 
-static int asus_wmi_evaluate_method3(u32 method_id,
-		u32 arg0, u32 arg1, u32 arg2, u32 *retval)
+/* Serializes all evaluations of ASUS_WMI_MGMT_GUID methods */
+static DEFINE_MUTEX(asus_wmi_eval_lock);
+
+static int asus_wmi_evaluate_method_raw(u32 method_id, struct bios_args *args,
+					union acpi_object **obj_ret)
+{
+	struct acpi_buffer input = { (acpi_size) sizeof(*args), args };
+	struct acpi_buffer output = { ACPI_ALLOCATE_BUFFER, NULL };
+	acpi_status status;
+
+	*obj_ret = NULL;
+
+	guard(mutex)(&asus_wmi_eval_lock);
+
+	pr_debug("%s called (0x%08x) with args: 0x%08x, 0x%08x, 0x%08x, 0x%08x, 0x%08x\n",
+		 __func__, method_id, args->arg0, args->arg1, args->arg2,
+		 args->arg3, args->arg4);
+
+	status = wmi_evaluate_method(ASUS_WMI_MGMT_GUID, 0, method_id,
+				     &input, &output);
+	if (ACPI_FAILURE(status))
+		return -EIO;
+
+	*obj_ret = output.pointer;
+	return 0;
+}
+
+static int asus_wmi_evaluate_method5(u32 method_id,
+		u32 arg0, u32 arg1, u32 arg2, u32 arg3, u32 arg4, u32 *retval)
 {
 	struct bios_args args = {
 		.arg0 = arg0,
 		.arg1 = arg1,
 		.arg2 = arg2,
+		.arg3 = arg3,
+		.arg4 = arg4,
 	};
-	struct acpi_buffer input = { (acpi_size) sizeof(args), &args };
-	struct acpi_buffer output = { ACPI_ALLOCATE_BUFFER, NULL };
-	acpi_status status;
 	union acpi_object *obj;
 	u32 tmp = 0;
+	int err;
 
-	status = wmi_evaluate_method(ASUS_WMI_MGMT_GUID, 0, method_id,
-				     &input, &output);
-
-	pr_debug("%s called (0x%08x) with args: 0x%08x, 0x%08x, 0x%08x\n",
-		__func__, method_id, arg0, arg1, arg2);
-	if (ACPI_FAILURE(status)) {
+	err = asus_wmi_evaluate_method_raw(method_id, &args, &obj);
+	if (err) {
 		pr_debug("%s, (0x%08x), arg 0x%08x failed: %d\n",
-			__func__, method_id, arg0, -EIO);
-		return -EIO;
+			__func__, method_id, arg0, err);
+		return err;
 	}
 
-	obj = (union acpi_object *)output.pointer;
 	if (obj && obj->type == ACPI_TYPE_INTEGER)
 		tmp = (u32) obj->integer.value;
 
@@ -394,57 +418,17 @@ static int asus_wmi_evaluate_method3(u32 method_id,
 	return 0;
 }
 
+static int asus_wmi_evaluate_method3(u32 method_id,
+				     u32 arg0, u32 arg1, u32 arg2, u32 *retval)
+{
+	return asus_wmi_evaluate_method5(method_id, arg0, arg1, arg2, 0, 0, retval);
+}
+
 int asus_wmi_evaluate_method(u32 method_id, u32 arg0, u32 arg1, u32 *retval)
 {
 	return asus_wmi_evaluate_method3(method_id, arg0, arg1, 0, retval);
 }
 EXPORT_SYMBOL_NS_GPL(asus_wmi_evaluate_method, "ASUS_WMI");
-
-static int asus_wmi_evaluate_method5(u32 method_id,
-		u32 arg0, u32 arg1, u32 arg2, u32 arg3, u32 arg4, u32 *retval)
-{
-	struct bios_args args = {
-		.arg0 = arg0,
-		.arg1 = arg1,
-		.arg2 = arg2,
-		.arg3 = arg3,
-		.arg4 = arg4,
-	};
-	struct acpi_buffer input = { (acpi_size) sizeof(args), &args };
-	struct acpi_buffer output = { ACPI_ALLOCATE_BUFFER, NULL };
-	acpi_status status;
-	union acpi_object *obj;
-	u32 tmp = 0;
-
-	status = wmi_evaluate_method(ASUS_WMI_MGMT_GUID, 0, method_id,
-				     &input, &output);
-
-	pr_debug("%s called (0x%08x) with args: 0x%08x, 0x%08x, 0x%08x, 0x%08x, 0x%08x\n",
-		__func__, method_id, arg0, arg1, arg2, arg3, arg4);
-	if (ACPI_FAILURE(status)) {
-		pr_debug("%s, (0x%08x), arg 0x%08x failed: %d\n",
-			__func__, method_id, arg0, -EIO);
-		return -EIO;
-	}
-
-	obj = (union acpi_object *)output.pointer;
-	if (obj && obj->type == ACPI_TYPE_INTEGER)
-		tmp = (u32) obj->integer.value;
-
-	pr_debug("Result: %x\n", tmp);
-	if (retval)
-		*retval = tmp;
-
-	kfree(obj);
-
-	if (tmp == ASUS_WMI_UNSUPPORTED_METHOD) {
-		pr_debug("%s, (0x%08x), arg 0x%08x failed: %d\n",
-			__func__, method_id, arg0, -ENODEV);
-		return -ENODEV;
-	}
-
-	return 0;
-}
 
 /*
  * Returns as an error if the method output is not a buffer. Typically this
@@ -458,24 +442,18 @@ static int asus_wmi_evaluate_method_buf(u32 method_id,
 		.arg1 = arg1,
 		.arg2 = 0,
 	};
-	struct acpi_buffer input = { (acpi_size) sizeof(args), &args };
-	struct acpi_buffer output = { ACPI_ALLOCATE_BUFFER, NULL };
-	acpi_status status;
 	union acpi_object *obj;
 	int err = 0;
 
-	status = wmi_evaluate_method(ASUS_WMI_MGMT_GUID, 0, method_id,
-				     &input, &output);
-
-	pr_debug("%s called (0x%08x) with args: 0x%08x, 0x%08x\n",
-		__func__, method_id, arg0, arg1);
-	if (ACPI_FAILURE(status)) {
+	err = asus_wmi_evaluate_method_raw(method_id, &args, &obj);
+	if (err) {
 		pr_debug("%s, (0x%08x), arg 0x%08x failed: %d\n",
-			__func__, method_id, arg0, -EIO);
-		return -EIO;
+			__func__, method_id, arg0, err);
+		return err;
 	}
 
-	obj = (union acpi_object *)output.pointer;
+	if (!obj)
+		return -ENODATA;
 
 	switch (obj->type) {
 	case ACPI_TYPE_BUFFER:
@@ -488,7 +466,8 @@ static int asus_wmi_evaluate_method_buf(u32 method_id,
 			break;
 		}
 
-		memcpy(ret_buffer, obj->buffer.pointer, obj->buffer.length);
+		if (ret_buffer)
+			memcpy(ret_buffer, obj->buffer.pointer, obj->buffer.length);
 		break;
 	case ACPI_TYPE_INTEGER:
 		err = (u32)obj->integer.value;
@@ -4916,19 +4895,13 @@ static int show_call(struct seq_file *m, void *data)
 		.arg0 = asus->debug.dev_id,
 		.arg1 = asus->debug.ctrl_param,
 	};
-	struct acpi_buffer input = { (acpi_size) sizeof(args), &args };
-	struct acpi_buffer output = { ACPI_ALLOCATE_BUFFER, NULL };
 	union acpi_object *obj;
-	acpi_status status;
+	int err;
 
-	status = wmi_evaluate_method(ASUS_WMI_MGMT_GUID,
-				     0, asus->debug.method_id,
-				     &input, &output);
+	err = asus_wmi_evaluate_method_raw(asus->debug.method_id, &args, &obj);
+	if (err)
+		return err;
 
-	if (ACPI_FAILURE(status))
-		return -EIO;
-
-	obj = (union acpi_object *)output.pointer;
 	if (obj && obj->type == ACPI_TYPE_INTEGER)
 		seq_printf(m, "%#x(%#x, %#x) = %#x\n", asus->debug.method_id,
 			   asus->debug.dev_id, asus->debug.ctrl_param,
