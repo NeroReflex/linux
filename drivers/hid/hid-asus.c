@@ -330,6 +330,7 @@ struct asus_drvdata {
 	unsigned long battery_next_query;
 	struct work_struct fn_lock_sync_work;
 	bool fn_lock;
+	struct work_struct fan_ctrl_work;
 };
 
 static int asus_report_battery(struct asus_drvdata *, u8 *, int);
@@ -3566,16 +3567,25 @@ static int asus_wmi_send_event(struct asus_drvdata *drvdata, u8 code)
 	err = asus_wmi_evaluate_method(ASUS_WMI_METHODID_DEVS,
 				       ASUS_WMI_METHODID_NOTIF, code, &retval);
 	if (err) {
-		pr_warn("Failed to notify asus-wmi: %d\n", err);
+		if (err != -ENODEV)
+			pr_warn("Failed to notify asus-wmi: %d\n", err);
 		return err;
 	}
 
-	if (retval != 0) {
+	if (retval > 1) {
 		pr_warn("Failed to notify asus-wmi (retval): 0x%x\n", retval);
 		return -EIO;
 	}
 
 	return 0;
+}
+
+static void asus_fan_ctrl_work(struct work_struct *work)
+{
+	struct asus_drvdata *drvdata =
+		container_of(work, struct asus_drvdata, fan_ctrl_work);
+
+	asus_wmi_send_event(drvdata, ASUS_FAN_CTRL_KEY_CODE);
 }
 
 static int asus_event(struct hid_device *hdev, struct hid_field *field,
@@ -3637,25 +3647,12 @@ static int asus_raw_event(struct hid_device *hdev,
 	if (drvdata->quirks & QUIRK_ROG_NKEY_KEYBOARD) {
 		if (report->id == FEATURE_KBD_REPORT_ID) {
 			/*
-			 * Fn+F5 fan control key - try to send WMI event to toggle fan mode.
-			 * If successful, block the event from reaching userspace.
-			 * If asus-wmi is unavailable or the call fails, let the event
-			 * pass to userspace so it can implement its own fan control.
+			 * Fn+F5 fan control key - defer WMI event to workqueue
+			 * since WMI evaluations sleep and cannot run in atomic context.
 			 */
 			if (data[1] == ASUS_FAN_CTRL_KEY_CODE) {
-				int ret = asus_wmi_send_event(drvdata, ASUS_FAN_CTRL_KEY_CODE);
-
-				if (ret == 0) {
-					/* Successfully handled by asus-wmi, block event */
-					return -1;
-				}
-
-				/*
-				 * Warn if asus-wmi failed (but not if it's unavailable).
-				 * Let the event reach userspace in all failure cases.
-				 */
-				if (ret != -ENODEV)
-					hid_warn(hdev, "Failed to notify asus-wmi: %d\n", ret);
+				schedule_work(&drvdata->fan_ctrl_work);
+				return -1;
 			}
 
 			/*
@@ -4472,6 +4469,9 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 
 	drvdata->quirks = id->driver_data;
 
+	if (drvdata->quirks & QUIRK_ROG_NKEY_KEYBOARD)
+		INIT_WORK(&drvdata->fan_ctrl_work, asus_fan_ctrl_work);
+
 	/*
 	 * T90CHI's keyboard dock returns same ID values as T100CHI's dock.
 	 * Thus, identify T90CHI dock with product name string.
@@ -4632,6 +4632,9 @@ static void asus_remove(struct hid_device *hdev)
 		cancel_work_sync(&drvdata->fn_lock_sync_work);
 
 	hid_hw_stop(hdev);
+
+	if (drvdata->quirks & QUIRK_ROG_NKEY_KEYBOARD)
+		cancel_work_sync(&drvdata->fan_ctrl_work);
 }
 
 static const __u8 asus_g752_fixed_rdesc[] = {
